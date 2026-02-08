@@ -14,3 +14,4 @@ path = "src/main.rs"
 core.workspace = true
 rander.workspace = true
 anyhow.workspace = true
+serde = "1.0.228"

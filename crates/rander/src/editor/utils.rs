@@ -23,15 +23,6 @@ pub(super) fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
 
-// 布尔值转 ON/OFF 文本。
-pub(super) fn on_off(value: bool) -> &'static str {
-    if value {
-        "ON"
-    } else {
-        "OFF"
-    }
-}
-
 // 判断坐标是否位于矩形内。
 pub(super) fn contains_point(area: Rect, x: u16, y: u16) -> bool {
     x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height

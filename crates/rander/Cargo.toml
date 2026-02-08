@@ -13,3 +13,9 @@ crossterm = "0.29.0"
 anyhow.workspace = true
 core.workspace = true
 rig-core = "0.30.0"
+tokio.workspace = true
+chrono = "0.4.40"
+pulldown-cmark = "0.13.0"
+syntect = { version = "5.2.0", default-features = false, features = ["default-fancy"] }
+serde_json.workspace = true
+serde.workspace = true
