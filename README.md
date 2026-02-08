@@ -22,7 +22,7 @@
 在仓库根目录执行：
 
 ```bash
-cargo run -p order
+cargo run
 ```
 
 常用开发命令：
