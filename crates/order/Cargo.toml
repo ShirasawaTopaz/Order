@@ -1,0 +1,16 @@
+[package]
+name = "order"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+authors= ["Shirasawa <3489840593@qq.com>"]
+
+[[bin]]
+name = "order"
+path = "src/main.rs"
+
+[dependencies]
+core.workspace = true
+rander.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "rander"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+#crate-type = ["dylib"]
+
+[dependencies]
+ratatui = "0.30.0"
+crossterm = "0.29.0"
+anyhow.workspace = true
+core.workspace = true
+rig-core = "0.30.0"

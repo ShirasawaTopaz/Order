@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/order",
+    "crates/core",
+    "crates/rander",
+    "crates/lsp",
+]
+
+default-members = ["crates/order"]
+
+[workspace.package]
+publish = false
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+core = { path = "crates/core" }
+rander = { path = "crates/rander" }
+rig-core = "0.30.0"
+
+anyhow = "1.0"
+tokio = { version = "1.49.0", features = ["full"] }

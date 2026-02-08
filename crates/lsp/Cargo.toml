@@ -1,0 +1,5 @@
+[package]
+name = "lsp"
+edition.workspace = true
+
+[dependencies]
