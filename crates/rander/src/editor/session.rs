@@ -131,6 +131,16 @@ impl Editor {
 
                     buffer.cursor_row = row;
                     buffer.cursor_col = col;
+                    // 会话恢复后视为“已打开但未编辑”的初始状态，
+                    // 等后续真实编辑动作触发 didChange。
+                    buffer.lsp_version = 1;
+                    buffer.lsp_dirty = false;
+                    buffer.lsp_last_synced_text = None;
+                    // 语义高亮与补全属于运行态数据，不应持久化到会话文件。
+                    // 在恢复时清空，避免展示过期 token 或补全项。
+                    buffer.lsp_completion_items.clear();
+                    buffer.lsp_semantic_tokens.clear();
+                    buffer.lsp_tokens_by_line.clear();
                     buffer.ensure_cursor_in_bounds();
                     buffers.push(buffer);
                 }

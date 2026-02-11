@@ -2,6 +2,7 @@ use std::cmp::min;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::sync::OnceLock;
 
+use lsp::LspSemanticToken;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -268,6 +269,8 @@ impl Editor {
         let mut lines = Vec::new();
         let end = min(buffer.lines.len(), buffer.scroll_row + visible);
         let is_markdown = Self::is_markdown_buffer(buffer);
+        let is_rust = Self::is_rust_buffer(buffer);
+        let use_semantic_highlight = Self::can_use_lsp_semantic_highlight(buffer);
         let mut markdown_fence_language = if is_markdown {
             Self::markdown_fence_language_before(buffer, buffer.scroll_row)
         } else {
@@ -287,6 +290,21 @@ impl Editor {
                     Self::highlight_markdown_line(line, palette, markdown_fence_language.as_deref());
                 markdown_fence_language = next_state;
                 spans.append(&mut highlighted);
+            } else if is_rust {
+                if use_semantic_highlight {
+                    let semantic_tokens = buffer
+                        .lsp_tokens_by_line
+                        .get(&row)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut highlighted =
+                        Self::highlight_line_with_lsp_tokens(line, &semantic_tokens, palette);
+                    spans.append(&mut highlighted);
+                } else {
+                    // Rust 语义 token 未就绪时，回退为普通文本，
+                    // 避免与“由 rust-analyzer 提供高亮”的要求相冲突。
+                    spans.push(Span::styled(line.clone(), Style::default().fg(palette.fg)));
+                }
             } else {
                 spans.push(Span::styled(line.clone(), Style::default().fg(palette.fg)));
             }
@@ -340,6 +358,129 @@ impl Editor {
 
         let name = buffer.name.to_ascii_lowercase();
         name.ends_with(".md") || name.ends_with(".markdown") || name.ends_with(".mdx")
+    }
+
+    /// 判断当前缓冲区是否为 Rust 文件。
+    ///
+    /// 识别规则：
+    /// - 已打开文件扩展名为 `.rs`；
+    /// - 或未落盘缓冲区名称后缀为 `.rs`。
+    fn is_rust_buffer(buffer: &EditorBuffer) -> bool {
+        let by_path = buffer.path.as_ref().and_then(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("rs"))
+        });
+        if by_path == Some(true) {
+            return true;
+        }
+
+        buffer.name.to_ascii_lowercase().ends_with(".rs")
+    }
+
+    /// 判断当前缓冲区是否适合使用 LSP 语义高亮。
+    ///
+    /// 这里限定“Rust + 已有 token”两个条件：
+    /// - Rust 语义高亮由 rust-analyzer 提供，符合用户要求；
+    /// - token 未返回时回退普通文本，避免闪烁和错色。
+    fn can_use_lsp_semantic_highlight(buffer: &EditorBuffer) -> bool {
+        let is_supported_language = lsp::detect_language_from_path_or_name(
+            buffer.path.as_deref(),
+            &buffer.name,
+        )
+        .is_some();
+        is_supported_language && !buffer.lsp_tokens_by_line.is_empty()
+    }
+
+    /// 将单行文本按 LSP 语义 token 进行着色。
+    ///
+    /// 关键策略：
+    /// - 严格按 token 起止切片，保留未覆盖片段为默认前景色；
+    /// - token 越界时自动截断，避免服务端异常数据导致 panic；
+    /// - token 重叠时以后到先用为主，保证视觉连续性。
+    fn highlight_line_with_lsp_tokens(
+        line: &str,
+        tokens: &[LspSemanticToken],
+        palette: ThemePalette,
+    ) -> Vec<Span<'static>> {
+        if tokens.is_empty() {
+            return vec![Span::styled(line.to_string(), Style::default().fg(palette.fg))];
+        }
+
+        let mut spans = Vec::new();
+        let line_char_count = line.chars().count();
+        let mut current_char = 0usize;
+
+        for token in tokens {
+            let token_start = token.start.min(line_char_count);
+            let token_end = token_start.saturating_add(token.length).min(line_char_count);
+            if token_start > current_char {
+                let plain_start = super::char_to_byte_index_in_line(line, current_char);
+                let plain_end = super::char_to_byte_index_in_line(line, token_start);
+                if plain_start <= plain_end && plain_end <= line.len() {
+                    spans.push(Span::styled(
+                        line[plain_start..plain_end].to_string(),
+                        Style::default().fg(palette.fg),
+                    ));
+                }
+            }
+
+            if token_end > token_start {
+                let token_start_byte = super::char_to_byte_index_in_line(line, token_start);
+                let token_end_byte = super::char_to_byte_index_in_line(line, token_end);
+                if token_start_byte <= token_end_byte && token_end_byte <= line.len() {
+                    spans.push(Span::styled(
+                        line[token_start_byte..token_end_byte].to_string(),
+                        Self::semantic_token_style(token, palette),
+                    ));
+                }
+                current_char = current_char.max(token_end);
+            }
+        }
+
+        if current_char < line_char_count {
+            let tail_start = super::char_to_byte_index_in_line(line, current_char);
+            if tail_start <= line.len() {
+                spans.push(Span::styled(
+                    line[tail_start..].to_string(),
+                    Style::default().fg(palette.fg),
+                ));
+            }
+        }
+
+        if spans.is_empty() {
+            spans.push(Span::styled(line.to_string(), Style::default().fg(palette.fg)));
+        }
+        spans
+    }
+
+    /// 将语义 token 类型映射到主题色。
+    ///
+    /// 映射优先考虑“结构可读性”：关键字/函数/类型/变量保持稳定对比。
+    fn semantic_token_style(token: &LspSemanticToken, palette: ThemePalette) -> Style {
+        let mut style = match token.token_type.as_str() {
+            "keyword" => Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
+            "string" => Style::default().fg(palette.ok),
+            "number" => Style::default().fg(palette.warn),
+            "function" | "method" => Style::default().fg(Color::Rgb(130, 170, 255)),
+            "type" | "struct" | "class" | "enum" | "interface" => {
+                Style::default().fg(Color::Rgb(255, 203, 107)).add_modifier(Modifier::BOLD)
+            }
+            "parameter" => Style::default().fg(Color::Rgb(199, 146, 234)),
+            "property" | "field" => Style::default().fg(Color::Rgb(128, 203, 196)),
+            "macro" => Style::default().fg(Color::Rgb(255, 158, 128)).add_modifier(Modifier::BOLD),
+            "comment" => Style::default().fg(palette.dim).add_modifier(Modifier::ITALIC),
+            "operator" => Style::default().fg(palette.accent),
+            _ => Style::default().fg(palette.fg),
+        };
+
+        if token.token_modifiers.iter().any(|item| item == "deprecated") {
+            style = style.add_modifier(Modifier::CROSSED_OUT);
+        }
+        if token.token_modifiers.iter().any(|item| item == "readonly") {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        style
     }
 
     /// 计算指定起始行之前的 fenced code 状态。
@@ -689,10 +830,17 @@ impl Editor {
             format!(" | cmd:{}", self.normal_pending)
         };
         let text = format!(
-            "{} | theme:{}{} | {}",
+            "{} | theme:{}{} | lsp:{} | ra:{} | op:{} | {}",
             mode,
             self.theme.as_str(),
             pending,
+            if self.lsp_client.is_running() {
+                "running"
+            } else {
+                "stopped"
+            },
+            self.rust_analyzer_status,
+            self.lsp_last_action,
             self.status_message
         );
         Paragraph::new(text)

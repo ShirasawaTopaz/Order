@@ -1,15 +1,16 @@
-use std::{cmp::min, collections::BTreeSet, path::PathBuf};
+use std::{
+    cmp::min,
+    path::{Path, PathBuf},
+};
 
 use core::commands::get_exit;
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout};
 
 use super::{
     Editor, MAX_TREE_RATIO, MIN_TREE_RATIO,
     types::{EditorBuffer, EditorMode, MainFocus, PaneFocus, SplitDirection, TabState},
-    utils::{contains_point, file_name_or, is_normal_command_prefix, is_word_char},
+    utils::{contains_point, file_name_or, is_normal_command_prefix},
 };
 
 impl Editor {
@@ -164,7 +165,11 @@ impl Editor {
                 self.status_message = "NORMAL".to_string();
                 self.refresh_completion();
             }
-            KeyCode::Char('j') if self.insert_j_pending => {
+            KeyCode::Char('k') if self.insert_j_pending => {
+                // `jk` 作为 INSERT 模式退出快捷键：
+                // - 首个 `j` 已在上一拍被插入；
+                // - 当前拍输入 `k` 时回退该 `j`，避免将 `jk` 残留到文本里。
+                self.active_buffer_mut().backspace();
                 self.mode = EditorMode::Normal;
                 self.insert_j_pending = false;
                 self.status_message = "NORMAL".to_string();
@@ -196,10 +201,22 @@ impl Editor {
                     self.refresh_completion();
                 }
             }
-            KeyCode::Left => self.active_buffer_mut().move_left(),
-            KeyCode::Right => self.active_buffer_mut().move_right(),
-            KeyCode::Up => self.active_buffer_mut().move_up(),
-            KeyCode::Down => self.active_buffer_mut().move_down(),
+            KeyCode::Left => {
+                self.active_buffer_mut().move_left();
+                self.refresh_completion();
+            }
+            KeyCode::Right => {
+                self.active_buffer_mut().move_right();
+                self.refresh_completion();
+            }
+            KeyCode::Up => {
+                self.active_buffer_mut().move_up();
+                self.refresh_completion();
+            }
+            KeyCode::Down => {
+                self.active_buffer_mut().move_down();
+                self.refresh_completion();
+            }
             _ => {
                 self.insert_j_pending = false;
             }
@@ -219,7 +236,8 @@ impl Editor {
                 }
             }
             KeyCode::Char('n')
-                if self.terminal_escape_pending && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                if self.terminal_escape_pending
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
                 self.mode = EditorMode::Normal;
                 self.terminal_escape_pending = false;
@@ -241,9 +259,16 @@ impl Editor {
             KeyCode::Char(ch) => {
                 let idx = (ch as u8).wrapping_sub(b'a') as usize;
                 if idx < self.buffers.len() {
+                    // 切换前对当前 Rust 文件发送 didClose，避免语言服务端保留陈旧打开状态。
+                    let current_idx = self.tabs[self.active_tab].buffer_index;
+                    self.try_send_did_close_for_buffer_idx(current_idx);
+
                     self.tabs[self.active_tab].buffer_index = idx;
                     self.mode = EditorMode::Normal;
                     self.status_message = format!("已切换到缓冲区：{}", self.buffers[idx].name);
+
+                    // 切换后对目标 Rust 缓冲区补发 didOpen，恢复语义上下文。
+                    self.try_send_did_open_for_buffer_idx(idx);
                 }
             }
             _ => {}
@@ -267,8 +292,9 @@ impl Editor {
         if self.show_tree {
             let tree_width = body.width.saturating_mul(self.tree_ratio) / 100;
             let divider_x = body.x + tree_width.saturating_sub(1);
-            let divider_hit =
-                mouse.column == divider_x && mouse.row >= body.y && mouse.row < body.y + body.height;
+            let divider_hit = mouse.column == divider_x
+                && mouse.row >= body.y
+                && mouse.row < body.y + body.height;
 
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) if divider_hit => {
@@ -381,7 +407,9 @@ impl Editor {
     }
 
     pub(super) fn adjust_tree_ratio(&mut self, body: ratatui::layout::Rect, mouse_x: u16) {
-        let relative = mouse_x.saturating_sub(body.x).clamp(1, body.width.saturating_sub(1));
+        let relative = mouse_x
+            .saturating_sub(body.x)
+            .clamp(1, body.width.saturating_sub(1));
         let ratio = ((relative as f32 / body.width.max(1) as f32) * 100.0).round() as u16;
         self.tree_ratio = ratio.clamp(MIN_TREE_RATIO, MAX_TREE_RATIO);
     }
@@ -489,7 +517,8 @@ impl Editor {
             }
             "tt" => {
                 self.show_tagbar = !self.show_tagbar;
-                self.status_message = format!("TagBar {}", if self.show_tagbar { "ON" } else { "OFF" });
+                self.status_message =
+                    format!("TagBar {}", if self.show_tagbar { "ON" } else { "OFF" });
                 true
             }
             "te" => {
@@ -554,6 +583,10 @@ impl Editor {
                 self.status_message = "NORMAL".to_string();
                 true
             }
+            "lc" => {
+                self.run_lsp_server_check();
+                true
+            }
             "fb" => {
                 self.theme = self.theme.next();
                 self.status_message = format!("theme => {}", self.theme.as_str());
@@ -568,7 +601,8 @@ impl Editor {
             }
             "]g" => {
                 if !self.diagnostics.is_empty() {
-                    self.diagnostic_index = min(self.diagnostic_index + 1, self.diagnostics.len() - 1);
+                    self.diagnostic_index =
+                        min(self.diagnostic_index + 1, self.diagnostics.len() - 1);
                     self.status_message = self.diagnostics[self.diagnostic_index].clone();
                 }
                 true
@@ -585,9 +619,18 @@ impl Editor {
 
     // 功能说明：见下方实现。
     pub(super) fn save_current_file(&mut self) {
+        // 在本地落盘前先发送 willSave 系列通知/请求，
+        // 尽量兼容语言服务端的保存前处理流程。
+        self.try_send_will_save_for_active_buffer();
+
         let root = self.root.clone();
         match self.active_buffer_mut().save(&root) {
-            Ok(path) => self.status_message = format!("保存成功：{}", path.display()),
+            Ok(path) => {
+                self.status_message = format!("保存成功：{}", path.display());
+
+                // 保存后发送 didSave，让 rust-analyzer 尽快更新语义/诊断。
+                self.try_send_did_save_for_path(&path);
+            }
             Err(err) => self.status_message = format!("保存失败：{}", err),
         }
     }
@@ -631,6 +674,16 @@ impl Editor {
 
     // 刷新自动补全候选列表。
     pub(super) fn refresh_completion(&mut self) {
+        // 先使用最近一次 LSP 返回结果更新 UI，再异步请求下一轮补全。
+        self.refresh_completion_from_lsp_cache();
+        self.request_completion_for_active_buffer();
+    }
+
+    /// 基于 buffer 缓存中的 LSP 补全项刷新展示列表。
+    ///
+    /// 这里按“当前前缀 + 插入文本”做一次轻过滤，
+    /// 是为了避免服务端返回候选过多时干扰编辑体验。
+    pub(super) fn refresh_completion_from_lsp_cache(&mut self) {
         let Some((_, _, prefix)) = self.active_buffer().word_prefix() else {
             self.completion_items.clear();
             self.completion_selected = 0;
@@ -642,26 +695,49 @@ impl Editor {
             return;
         }
 
-        let mut words = BTreeSet::new();
-        for line in &self.active_buffer().lines {
-            let mut current = String::new();
-            for ch in line.chars() {
-                if is_word_char(ch) {
-                    current.push(ch);
-                } else if !current.is_empty() {
-                    if current.starts_with(&prefix) && current != prefix {
-                        words.insert(current.clone());
-                    }
-                    current.clear();
-                }
+        let mut candidates = Vec::new();
+        for item in &self.active_buffer().lsp_completion_items {
+            let insert_text = item.insert_text.as_deref().unwrap_or(&item.label);
+            if insert_text.starts_with(&prefix) && insert_text != prefix {
+                candidates.push(insert_text.to_string());
+                continue;
             }
-            if !current.is_empty() && current.starts_with(&prefix) && current != prefix {
-                words.insert(current);
+
+            // 当服务端返回 label 与 insertText 不一致时，
+            // 回退到 label 过滤，确保候选不会被意外漏掉。
+            if item.label.starts_with(&prefix) && item.label != prefix {
+                candidates.push(item.label.clone());
             }
         }
-        self.completion_items = words.into_iter().take(20).collect();
+
+        candidates.sort();
+        candidates.dedup();
+        self.completion_items = candidates.into_iter().take(20).collect();
         if self.completion_selected >= self.completion_items.len() {
             self.completion_selected = 0;
+        }
+    }
+
+    /// 向当前活动缓冲区发起一次 LSP 补全请求。
+    ///
+    /// 采用“异步请求 + 下一帧消费”策略，避免在按键路径中阻塞输入手感。
+    fn request_completion_for_active_buffer(&mut self) {
+        let buffer_idx = self.tabs[self.active_tab].buffer_index;
+        let Some((path, cursor_row, cursor_col)) =
+            self.buffers.get(buffer_idx).and_then(|buffer| {
+                let path = buffer.path.as_ref()?.clone();
+                Some((path, buffer.cursor_row, buffer.cursor_col))
+            })
+        else {
+            // 未落盘缓冲区无法生成稳定 URI，暂不触发 LSP 补全。
+            return;
+        };
+
+        if let Err(error) = self
+            .lsp_client
+            .request_completion(&path, cursor_row, cursor_col)
+        {
+            self.status_message = format!("LSP completion 请求失败: {error}");
         }
     }
 
@@ -670,7 +746,22 @@ impl Editor {
         if self.completion_items.is_empty() {
             return;
         }
-        let choice = self.completion_items[self.completion_selected].clone();
+
+        let selected_label = self.completion_items[self.completion_selected].clone();
+        let choice = self
+            .active_buffer()
+            .lsp_completion_items
+            .iter()
+            .find_map(|item| {
+                let insert_text = item.insert_text.as_deref().unwrap_or(&item.label);
+                if insert_text == selected_label || item.label == selected_label {
+                    Some(insert_text.to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(selected_label);
+
         if let Some((start, end, _)) = self.active_buffer().word_prefix() {
             self.active_buffer_mut().replace_prefix(start, end, &choice);
         }
@@ -697,12 +788,22 @@ impl Editor {
             self.status_message = "至少保留一个 TAB".to_string();
             return;
         }
+
+        let closing_idx = self.tabs[self.active_tab].buffer_index;
+        self.try_send_did_close_for_buffer_idx(closing_idx);
+
         self.tabs.remove(self.active_tab);
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len().saturating_sub(1);
         }
         self.normalize_active_tab_focus();
         self.status_message = "已关闭 TAB".to_string();
+
+        // 关闭后给新激活页补发 didOpen，保证 LSP 文档上下文一致。
+        if !self.tabs.is_empty() {
+            let active_idx = self.tabs[self.active_tab].buffer_index;
+            self.try_send_did_open_for_buffer_idx(active_idx);
+        }
     }
 
     // 切换到下一个标签页。
@@ -742,6 +843,9 @@ impl Editor {
             self.tabs[self.active_tab].buffer_index = idx;
             self.tabs[self.active_tab].title = file_name_or(path.as_path(), "Tab").to_string();
             self.status_message = format!("已打开：{}", path.display());
+
+            // 对已缓存的 Rust 文件同样发送 didOpen，确保 LSP 获取最新上下文。
+            self.try_send_did_open_for_buffer_idx(idx);
             return;
         }
 
@@ -752,10 +856,118 @@ impl Editor {
                 self.tabs[self.active_tab].buffer_index = idx;
                 self.tabs[self.active_tab].title = file_name_or(path.as_path(), "Tab").to_string();
                 self.status_message = format!("已打开：{}", path.display());
+
+                self.try_send_did_open_for_buffer_idx(idx);
             }
             Err(err) => {
                 self.status_message = format!("打开失败：{}", err);
             }
+        }
+    }
+
+    /// 若指定缓冲区是受支持语言文件，则发送 `textDocument/didOpen`。
+    ///
+    /// 该方法会在 `editor::mod` 的缓冲区切换逻辑中被复用，
+    /// 因此需要对父模块可见，避免重复实现同一套 didOpen 触发流程。
+    pub(super) fn try_send_did_open_for_buffer_idx(&mut self, buffer_idx: usize) {
+        let Some((path, text, version)) = self.buffers.get(buffer_idx).and_then(|buffer| {
+            let path = buffer.path.as_ref()?.clone();
+            Some((path, buffer.lines.join("\n"), buffer.lsp_version))
+        }) else {
+            return;
+        };
+
+        match self
+            .lsp_client
+            .send_did_open(&self.root, &path, &text, version)
+        {
+            Ok(_) => {
+                self.status_message = format!("已打开：{}（LSP didOpen 已发送）", path.display());
+                if let Some(buffer_mut) = self.buffers.get_mut(buffer_idx) {
+                    buffer_mut.lsp_dirty = false;
+                    buffer_mut.lsp_last_synced_text = Some(text);
+                }
+
+                // `didOpen` 后主动拉取语义 token，确保首次渲染就有语义高亮。
+                if let Err(error) = self.lsp_client.request_semantic_tokens(&path) {
+                    self.status_message = format!(
+                        "已打开：{}（LSP semanticTokens 失败: {}）",
+                        path.display(),
+                        error
+                    );
+                }
+            }
+            Err(error) => {
+                self.status_message =
+                    format!("已打开：{}（LSP didOpen 失败: {}）", path.display(), error);
+            }
+        }
+    }
+
+    /// 若指定缓冲区是受支持语言文件，则发送 `textDocument/didClose`。
+    fn try_send_did_close_for_buffer_idx(&mut self, buffer_idx: usize) {
+        let Some(path) = self
+            .buffers
+            .get(buffer_idx)
+            .and_then(|buffer| buffer.path.as_ref().cloned())
+        else {
+            return;
+        };
+
+        match self.lsp_client.send_did_close(&path) {
+            Ok(_) => {
+                self.status_message = format!("LSP didClose：{}", path.display());
+            }
+            Err(error) => {
+                self.status_message = format!("LSP didClose 失败：{}", error);
+            }
+        }
+    }
+
+    /// 若路径是受支持语言文件，则发送 `textDocument/didSave`。
+    fn try_send_did_save_for_path(&mut self, path: &Path) {
+        let text = self.active_buffer().lines.join("\n");
+        match self.lsp_client.send_did_save(path, &text) {
+            Ok(_) => {
+                self.status_message = format!("保存成功：{}（LSP didSave 已发送）", path.display());
+
+                // 保存后触发语义 token 刷新，确保格式化/导入变化能及时反映。
+                if let Err(error) = self.lsp_client.request_semantic_tokens(path) {
+                    self.status_message = format!(
+                        "保存成功：{}（LSP semanticTokens 失败: {}）",
+                        path.display(),
+                        error
+                    );
+                }
+            }
+            Err(error) => {
+                self.status_message = format!(
+                    "保存成功：{}（LSP didSave 失败: {}）",
+                    path.display(),
+                    error
+                );
+            }
+        }
+    }
+
+    /// 对当前活动缓冲区发送 willSave 与 willSaveWaitUntil。
+    fn try_send_will_save_for_active_buffer(&mut self) {
+        let buffer_idx = self.tabs[self.active_tab].buffer_index;
+        let Some(path) = self
+            .buffers
+            .get(buffer_idx)
+            .and_then(|buffer| buffer.path.as_ref().cloned())
+        else {
+            return;
+        };
+
+        if let Err(error) = self.lsp_client.send_will_save(&path) {
+            self.status_message = format!("LSP willSave 失败：{}", error);
+            return;
+        }
+
+        if let Err(error) = self.lsp_client.send_will_save_wait_until(&path) {
+            self.status_message = format!("LSP willSaveWaitUntil 失败：{}", error);
         }
     }
 
@@ -774,12 +986,63 @@ impl Editor {
         }
 
         if let Some(path) = selected_path
-            && let Some(idx) = self.tree_entries.iter().position(|entry| entry.path == path)
+            && let Some(idx) = self
+                .tree_entries
+                .iter()
+                .position(|entry| entry.path == path)
         {
             self.tree_selected = idx;
             return;
         }
 
         self.tree_selected = min(self.tree_selected, self.tree_entries.len() - 1);
+    }
+
+    /// 执行 LSP 服务器可用性检查，并将结果汇总到状态栏。
+    ///
+    /// 结果展示策略：
+    /// - 全部可用时给出成功摘要；
+    /// - 存在缺失时显示缺失语言与安装建议（截断到可读长度）。
+    fn run_lsp_server_check(&mut self) {
+        let report = self.lsp_client.check_server_availability();
+        let missing_items: Vec<_> = report
+            .items
+            .iter()
+            .filter(|item| !item.available)
+            .cloned()
+            .collect();
+
+        if missing_items.is_empty() {
+            self.status_message = format!(
+                "LSP 检查通过：{}/{} 可用",
+                report.available_count(),
+                report.items.len()
+            );
+            return;
+        }
+
+        let missing_languages = missing_items
+            .iter()
+            .map(|item| item.language.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let hint = missing_items
+            .first()
+            .map(|item| format!("{}（命令 `{}`）", item.install_hint, item.server_command))
+            .unwrap_or_else(|| "请检查语言服务器安装与 PATH".to_string());
+
+        // 状态栏空间有限，这里做一次长度保护，避免挤压其他关键信息。
+        let mut message = format!(
+            "LSP 缺失 {}/{}：{}。{}",
+            report.missing_count(),
+            report.items.len(),
+            missing_languages,
+            hint
+        );
+        if message.chars().count() > 180 {
+            message = message.chars().take(180).collect::<String>() + "…";
+        }
+        self.status_message = message;
     }
 }

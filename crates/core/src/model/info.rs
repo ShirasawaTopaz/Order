@@ -1,9 +1,4 @@
-use std::{
-    collections::HashSet,
-    env,
-    fs,
-    path::PathBuf,
-};
+use std::{collections::HashSet, env, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -106,7 +101,9 @@ struct ModelConfigFile {
 /// 将模型追加到列表，按 `provider + model_name` 去重。
 fn push_unique_model(list: &mut Vec<ModelInfo>, model: ModelInfo) {
     let duplicated = list.iter().any(|existing| {
-        existing.provider_name.eq_ignore_ascii_case(&model.provider_name)
+        existing
+            .provider_name
+            .eq_ignore_ascii_case(&model.provider_name)
             && existing.model_name.eq_ignore_ascii_case(&model.model_name)
     });
     if !duplicated {
@@ -121,7 +118,8 @@ fn load_explicit_model_from_env() -> Option<ModelInfo> {
     let provider_name = first_non_empty_env(&["ORDER_MODEL_PROVIDER", "ORDER_PROVIDER"])?;
     let model_name = first_non_empty_env(&["ORDER_MODEL_NAME", "ORDER_MODEL"])?;
 
-    let api_url = first_non_empty_env(&["ORDER_MODEL_API_URL", "ORDER_API_URL"]).unwrap_or_default();
+    let api_url =
+        first_non_empty_env(&["ORDER_MODEL_API_URL", "ORDER_API_URL"]).unwrap_or_default();
     let token = first_non_empty_env(&["ORDER_MODEL_TOKEN", "ORDER_API_KEY"]).unwrap_or_default();
 
     let support_tools = first_non_empty_env(&["ORDER_MODEL_SUPPORT_TOOLS"])
@@ -156,6 +154,28 @@ fn load_explicit_model_from_env() -> Option<ModelInfo> {
 /// - 若存在 API Key，默认给出常见模型名；
 /// - 模型名可通过 provider 对应环境变量覆盖。
 fn load_fallback_model_from_provider_env() -> Option<ModelInfo> {
+    // Codex 作为 OpenAI 的“编码型”模型常被单独配置。
+    // 优先读取 `CODEX_API_KEY`，避免与通用 OpenAI 配置互相覆盖。
+    if let Ok(token) = env::var("CODEX_API_KEY")
+        && !token.trim().is_empty()
+    {
+        let model_name = env::var("CODEX_MODEL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        let api_url = env::var("CODEX_BASE_URL").unwrap_or_default();
+        return Some(ModelInfo {
+            api_url,
+            token,
+            model_name,
+            support_tools: false,
+            provider_name: "codex".to_string(),
+            model_max_context: 0,
+            model_max_output: 0,
+            model_max_tokens: 0,
+        });
+    }
+
     if let Ok(token) = env::var("OPENAI_API_KEY")
         && !token.trim().is_empty()
     {
@@ -296,7 +316,10 @@ fn candidate_config_paths() -> Result<Vec<PathBuf>> {
 fn parse_model_config_value(value: &Value) -> Result<ModelConfigFile> {
     match value {
         Value::Array(items) => {
-            let models = items.iter().filter_map(parse_model_info_from_value).collect();
+            let models = items
+                .iter()
+                .filter_map(parse_model_info_from_value)
+                .collect();
             Ok(ModelConfigFile {
                 current: None,
                 models,
@@ -317,7 +340,12 @@ fn parse_model_config_value(value: &Value) -> Result<ModelConfigFile> {
             let models = object
                 .get("models")
                 .and_then(Value::as_array)
-                .map(|items| items.iter().filter_map(parse_model_info_from_value).collect())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(parse_model_info_from_value)
+                        .collect()
+                })
                 .unwrap_or_default();
 
             let current_model_name = read_string_key(
@@ -344,13 +372,16 @@ fn parse_model_info_from_value(value: &Value) -> Option<ModelInfo> {
     let provider_name = read_string_key(object, &["provider_name", "providerName", "provider"])?;
     let model_name = read_string_key(object, &["model_name", "modelName", "model", "name"])?;
 
-    let api_url = read_string_key(object, &["api_url", "apiUrl", "base_url", "baseUrl"])
-        .unwrap_or_default();
+    let api_url =
+        read_string_key(object, &["api_url", "apiUrl", "base_url", "baseUrl"]).unwrap_or_default();
     let token = read_string_key(object, &["token", "api_key", "apiKey", "key"]).unwrap_or_default();
     let support_tools = read_bool_key(object, &["support_tools", "supportTools"]).unwrap_or(false);
-    let model_max_context = read_u32_key(object, &["model_max_context", "modelMaxContext"]).unwrap_or(0);
-    let model_max_output = read_u32_key(object, &["model_max_output", "modelMaxOutput"]).unwrap_or(0);
-    let model_max_tokens = read_u32_key(object, &["model_max_tokens", "modelMaxTokens"]).unwrap_or(0);
+    let model_max_context =
+        read_u32_key(object, &["model_max_context", "modelMaxContext"]).unwrap_or(0);
+    let model_max_output =
+        read_u32_key(object, &["model_max_output", "modelMaxOutput"]).unwrap_or(0);
+    let model_max_tokens =
+        read_u32_key(object, &["model_max_tokens", "modelMaxTokens"]).unwrap_or(0);
 
     Some(normalize_model_info(ModelInfo {
         api_url,
@@ -484,7 +515,9 @@ mod tests {
     #[test]
     fn candidate_config_paths_contains_runtime_paths() {
         let paths = candidate_config_paths().expect("should build candidate paths");
-        let has_model_json = paths.iter().any(|path| path.ends_with(Path::new("model.json")));
+        let has_model_json = paths
+            .iter()
+            .any(|path| path.ends_with(Path::new("model.json")));
         assert!(has_model_json);
     }
 }

@@ -1,8 +1,11 @@
-use std::path::Path;
-
 use rig::{completion::ToolDefinition, tool::Tool};
 use serde::{Deserialize, Serialize};
 use tokio::{fs::File, io::AsyncWriteExt};
+
+use super::workspace::{
+    MAX_WRITE_BYTES, ensure_no_symlink_in_existing_path, resolve_workspace_relative_path,
+    workspace_root,
+};
 
 #[derive(Clone, Deserialize)]
 pub struct WriteToolArgs {
@@ -47,21 +50,22 @@ impl Tool for WriteTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Writes content to a file".to_string(),
+            description: "写入工作区内文件内容（仅允许相对路径，默认将 CRLF 规范为 LF）"
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file to write"
+                        "description": "相对路径（基于当前工作区根目录），例如 `crates/core/src/lib.rs`"
                     },
                     "content": {
                         "type": "string",
-                        "description": "Content to write"
+                        "description": "要写入的文本内容（UTF-8）"
                     },
                     "append": {
                         "type": "boolean",
-                        "description": "Append content if true, overwrite if false (default false)"
+                        "description": "为 true 时追加；为 false 时覆盖（默认 false）"
                     }
                 },
                 "required": ["path", "content"]
@@ -70,8 +74,22 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let path = Path::new(&args.path);
+        // 通过“工作区内相对路径”约束模型可写入的范围，避免越权写文件。
+        let root = workspace_root().map_err(WriteToolError::Other)?;
+        let path =
+            resolve_workspace_relative_path(&root, &args.path).map_err(WriteToolError::Other)?;
+        ensure_no_symlink_in_existing_path(&root, &path).map_err(WriteToolError::Other)?;
+
         let append = args.append.unwrap_or(false);
+
+        // 统一将 CRLF 规范为 LF，减少跨平台协作时的 diff 噪音。
+        let content = args.content.replace("\r\n", "\n");
+        if content.as_bytes().len() > MAX_WRITE_BYTES {
+            return Err(WriteToolError::Other(format!(
+                "写入内容过大（{} bytes），已拒绝写入；请拆分或提高上限",
+                content.as_bytes().len()
+            )));
+        }
 
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -85,16 +103,16 @@ impl Tool for WriteTool {
             let mut file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)
+                .open(&path)
                 .await
                 .map_err(WriteToolError::IoError)?;
-            file.write_all(args.content.as_bytes())
+            file.write_all(content.as_bytes())
                 .await
                 .map_err(WriteToolError::IoError)?;
             file.flush().await.map_err(WriteToolError::IoError)?;
         } else {
-            let mut file = File::create(path).await.map_err(WriteToolError::IoError)?;
-            file.write_all(args.content.as_bytes())
+            let mut file = File::create(&path).await.map_err(WriteToolError::IoError)?;
+            file.write_all(content.as_bytes())
                 .await
                 .map_err(WriteToolError::IoError)?;
             file.flush().await.map_err(WriteToolError::IoError)?;
@@ -103,4 +121,3 @@ impl Tool for WriteTool {
         Ok(format!("write success: {}", path.display()))
     }
 }
-

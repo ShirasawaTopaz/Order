@@ -1187,6 +1187,10 @@ dependencies = [
 [[package]]
 name = "lsp"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+]
 
 [[package]]
 name = "mac_address"
@@ -1720,6 +1724,7 @@ dependencies = [
  "chrono",
  "core",
  "crossterm",
+ "lsp",
  "pulldown-cmark",
  "ratatui",
  "rig-core",

@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{Context, anyhow};
 use chrono::Local;
 use core::{
-    commands::{get_exit, EXIT},
+    commands::{EXIT, get_exit},
     model::{
         connection::{Connection, Provider},
         info::get_current_model_info,
@@ -19,21 +19,21 @@ use crossterm::{
     },
     execute,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
-use serde::{Deserialize, Serialize};
 
 use ratatui::{
+    DefaultTerminal, Frame,
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Paragraph, Widget},
-    DefaultTerminal, Frame,
 };
 
 /// 对话消息角色。
@@ -427,9 +427,8 @@ impl OrderTui<'_> {
                             }
                         } else {
                             // `/history N`：保持快速回显最近 N 轮能力。
-                            let rounds_parse_result = maybe_rounds
-                                .map(Self::parse_history_rounds)
-                                .transpose();
+                            let rounds_parse_result =
+                                maybe_rounds.map(Self::parse_history_rounds).transpose();
 
                             match rounds_parse_result {
                                 Ok(rounds) => {
@@ -443,7 +442,11 @@ impl OrderTui<'_> {
                                     }
                                 }
                                 Err(error) => {
-                                    self.push_chat_message(ChatRole::Error, error.to_string(), false);
+                                    self.push_chat_message(
+                                        ChatRole::Error,
+                                        error.to_string(),
+                                        false,
+                                    );
                                 }
                             }
                         }
@@ -504,9 +507,7 @@ impl OrderTui<'_> {
 
         // 消息入队后立即尝试持久化到运行目录。
         // 历史写入失败不影响主流程，仅通过标准错误输出告警。
-        if persist_to_history
-            && let Err(error) = self.persist_history()
-        {
+        if persist_to_history && let Err(error) = self.persist_history() {
             eprintln!("failed to persist history: {error}");
         }
     }
@@ -580,8 +581,7 @@ impl OrderTui<'_> {
 
     /// 将历史结构以 UTF-8 JSON（pretty）写回磁盘。
     fn write_history_file(path: &PathBuf, file: &HistoryFile) -> anyhow::Result<()> {
-        let content = serde_json::to_string_pretty(&file.records)
-            .context("序列化历史记录失败")?;
+        let content = serde_json::to_string_pretty(&file.records).context("序列化历史记录失败")?;
         fs::write(path, content).with_context(|| format!("写入历史文件失败: {}", path.display()))
     }
 
@@ -722,22 +722,21 @@ impl OrderTui<'_> {
             .flat_map(|record| {
                 let date = record.date;
                 let model = record.model;
-                record.history.into_iter().map(move |session| HistoryListItem {
-                    date: date.clone(),
-                    model: model.clone(),
-                    timestamp: session.timestamp,
-                    message_count: session.conversations.len(),
-                    conversations: session.conversations,
-                })
+                record
+                    .history
+                    .into_iter()
+                    .map(move |session| HistoryListItem {
+                        date: date.clone(),
+                        model: model.clone(),
+                        timestamp: session.timestamp,
+                        message_count: session.conversations.len(),
+                        conversations: session.conversations,
+                    })
             })
             .collect::<Vec<HistoryListItem>>();
 
         if items.is_empty() {
-            self.push_chat_message(
-                ChatRole::Error,
-                "没有可选择的历史会话".to_string(),
-                false,
-            );
+            self.push_chat_message(ChatRole::Error, "没有可选择的历史会话".to_string(), false);
             return Ok(());
         }
 
@@ -763,7 +762,9 @@ impl OrderTui<'_> {
     fn build_history_browser_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines = vec![Line::from(Span::styled(
             "History Browser: Up/Down 选择，Enter 加载，Esc 返回",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ))];
 
         let Some(browser) = self.history_browser.as_ref() else {
@@ -781,7 +782,11 @@ impl OrderTui<'_> {
             let mut text = raw;
             let max_chars = width.saturating_sub(1).max(1);
             if text.chars().count() > max_chars {
-                text = text.chars().take(max_chars.saturating_sub(2)).collect::<String>() + "..";
+                text = text
+                    .chars()
+                    .take(max_chars.saturating_sub(2))
+                    .collect::<String>()
+                    + "..";
             }
 
             let style = if is_selected {
@@ -846,6 +851,7 @@ impl OrderTui<'_> {
             model_info.api_url,
             model_info.token,
             model_info.model_name,
+            model_info.support_tools,
         ));
 
         Ok(())
@@ -856,9 +862,11 @@ impl OrderTui<'_> {
     /// 为了兼容不同配置写法，这里支持多个同义值：
     /// - `claude` 与 `anthropic` 统一映射到 `Provider::Claude`
     /// - `openaiapi` 与 `openai_api` 统一映射到 `Provider::OpenAIAPI`
+    /// - `codex` 映射到 `Provider::Codex`（内部仍使用 OpenAI 客户端）
     fn parse_provider(provider_name: &str) -> anyhow::Result<Provider> {
         match provider_name.trim().to_ascii_lowercase().as_str() {
             "openai" => Ok(Provider::OpenAI),
+            "codex" => Ok(Provider::Codex),
             "claude" | "anthropic" => Ok(Provider::Claude),
             "gemini" => Ok(Provider::Gemini),
             "openaiapi" | "openai_api" => Ok(Provider::OpenAIAPI),
@@ -913,12 +921,16 @@ impl OrderTui<'_> {
             let (prefix, style, is_right_aligned) = match message.role {
                 ChatRole::User => (
                     "",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                     true,
                 ),
                 ChatRole::Llm => (
                     "LLM",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                     false,
                 ),
                 ChatRole::Error => (
@@ -1007,7 +1019,8 @@ impl Widget for &OrderTui<'_> {
             chat_block.render(main_area, buf);
 
             if chat_inner.width > 0 && chat_inner.height > 0 {
-                let mut conversation_lines = self.build_conversation_lines(chat_inner.width as usize);
+                let mut conversation_lines =
+                    self.build_conversation_lines(chat_inner.width as usize);
 
                 let max_visible_lines = chat_inner.height as usize;
                 if conversation_lines.len() > max_visible_lines {
@@ -1065,7 +1078,10 @@ impl Widget for &OrderTui<'_> {
             ("/help", "Show help information"),
             ("/exit", "Exit the application"),
             ("/cancel", "Cancel latest operation"),
-            ("/history", "Open history browser; /history N; /history clear"),
+            (
+                "/history",
+                "Open history browser; /history N; /history clear",
+            ),
             ("/skills", "Manage project skills"),
             ("/rules", "Edit project rules"),
             ("/settings", "Configure settings"),

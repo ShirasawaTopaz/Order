@@ -9,7 +9,7 @@
 - `crates/order`：程序入口（可执行文件）。
 - `crates/rander`：TUI 与编辑器界面逻辑。
 - `crates/core`：核心能力（命令、模型连接、类型定义）。
-- `crates/lsp`：LSP 相关模块（当前为预留骨架）。
+- `crates/lsp`：多语言 LSP 客户端与协议适配层。
 
 ## 环境要求
 
@@ -52,19 +52,58 @@ cargo check --workspace
 `core` 中已支持以下 Provider 枚举：
 
 - `OpenAI`
+- `Codex`
 - `Claude`
 - `Gemini`
 - `OpenAIAPI`
 
 当连接配置未显式传入 `api_key` 时，会按 Provider 读取环境变量：
 
+- `CODEX_API_KEY`（Codex 优先；未设置会回退到 `OPENAI_API_KEY`）
 - `OPENAI_API_KEY`
 - `ANTHROPIC_API_KEY`
 - `GEMINI_API_KEY`
 
-## 当前状态说明
+## 模型配置（推荐）
 
-- 编辑器与主界面可运行，支持基本输入与焦点切换流程。
-- `lsp` 模块为预留结构，后续可按需求扩展。
-- 部分模型信息读取逻辑仍为 TODO（见 `core` 模块实现）。
+推荐在仓库根目录创建 `.order/model.json`（可参考 `.order/model.example.json`）。
 
+配置文件支持字段（常用）：
+
+- `provider`：`openai` / `codex` / `claude` / `gemini` / `openaiapi`
+- `model`：例如 `gpt-5.3-codex`
+- `api_url`：可选，自定义 Base URL
+- `token`：可选；为空时会读取对应环境变量
+- `support_tools`：是否启用工具调用（见下）
+
+当 `provider` 为 `openai` 或 `codex` 且 `support_tools = true` 时，会启用内置文件工具：
+
+- `ReadTool`：读取工作区内文件（仅相对路径、UTF-8、大小受限）
+- `WriteTool`：写入工作区内文件（仅相对路径、默认写入 LF、大小受限）
+- `SearchFileTool`：在工作区内递归搜索关键字（仅相对路径、结果数量受限）
+
+## LSP 能力说明
+
+编辑器当前支持以下语言的 LSP 诊断、补全与语义高亮：
+
+- Rust（`rust-analyzer`）
+- Python（`pylsp`）
+- TypeScript / JavaScript（`typescript-language-server --stdio`）
+- HTML（`vscode-html-language-server --stdio`）
+- CSS（`vscode-css-language-server --stdio`）
+- Vue（`vue-language-server --stdio`）
+- Java（`jdtls`）
+- Go（`gopls`）
+- C / C++（`clangd`）
+
+说明：
+
+- 语言服务器采用“按需启动”，在首次打开对应语言文件时自动拉起。
+- Rust 代码高亮已切换为由 `rust-analyzer` 返回的语义 token 驱动。
+- 代码补全由 LSP 异步返回并在编辑器中缓存展示。
+
+编辑器内可执行命令：
+
+- `lc`：执行 LSP 服务器可用性检查（是否在 PATH 中可用）。
+  - 全部可用：状态栏显示通过摘要。
+  - 有缺失：状态栏显示缺失语言与安装建议。

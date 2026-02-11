@@ -12,6 +12,7 @@ ratatui = "0.30.0"
 crossterm = "0.29.0"
 anyhow.workspace = true
 core.workspace = true
+lsp = { path = "../lsp" }
 rig-core = "0.30.0"
 tokio.workspace = true
 chrono = "0.4.40"

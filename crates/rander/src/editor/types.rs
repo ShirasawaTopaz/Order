@@ -1,10 +1,13 @@
 use std::{
     cmp::min,
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
 
 use ratatui::style::Color;
+
+use lsp::{LspCompletionItem, LspSemanticToken};
 
 use super::utils::{char_count, char_to_byte_index, file_name_or, is_word_char};
 
@@ -138,6 +141,33 @@ pub(super) struct EditorBuffer {
     pub(super) cursor_col: usize,
     pub(super) scroll_row: usize,
     pub(super) modified: bool,
+    /// LSP 文档版本号。
+    ///
+    /// 按 LSP 规范，`didOpen/didChange` 需携带单调递增版本号。
+    pub(super) lsp_version: i32,
+    /// 当前缓冲区是否存在尚未同步到 LSP 的变更。
+    ///
+    /// 当编辑内容变化后置为 `true`，同步成功后置为 `false`。
+    pub(super) lsp_dirty: bool,
+    /// 最近一次成功同步到 LSP 的文本快照。
+    ///
+    /// 用于增量 `didChange` 计算 old/new 差异。
+    pub(super) lsp_last_synced_text: Option<String>,
+    /// 当前缓冲区最近一次 LSP 返回的补全候选。
+    ///
+    /// 使用结构化补全项而不是纯字符串，
+    /// 是为了后续可扩展 `insert_text/detail` 等上下文信息。
+    pub(super) lsp_completion_items: Vec<LspCompletionItem>,
+    /// 当前缓冲区最近一次 LSP 返回的语义高亮 token。
+    ///
+    /// 语义 token 由 LSP 异步返回，渲染阶段按行读取，
+    /// 因此将其缓存在 buffer 内可避免重复请求。
+    pub(super) lsp_semantic_tokens: Vec<LspSemanticToken>,
+    /// 按行索引后的语义 token 映射。
+    ///
+    /// 将 token 预先分组到行级，可以把渲染时复杂度降到 O(当前行 token 数)，
+    /// 避免每一帧都全量扫描 token 列表。
+    pub(super) lsp_tokens_by_line: HashMap<usize, Vec<LspSemanticToken>>,
 }
 
 impl EditorBuffer {
@@ -151,6 +181,12 @@ impl EditorBuffer {
             cursor_col: 0,
             scroll_row: 0,
             modified: false,
+            lsp_version: 1,
+            lsp_dirty: false,
+            lsp_last_synced_text: None,
+            lsp_completion_items: Vec::new(),
+            lsp_semantic_tokens: Vec::new(),
+            lsp_tokens_by_line: HashMap::new(),
         }
     }
 
@@ -169,6 +205,12 @@ impl EditorBuffer {
             cursor_col: 0,
             scroll_row: 0,
             modified: false,
+            lsp_version: 1,
+            lsp_dirty: false,
+            lsp_last_synced_text: None,
+            lsp_completion_items: Vec::new(),
+            lsp_semantic_tokens: Vec::new(),
+            lsp_tokens_by_line: HashMap::new(),
         })
     }
 
@@ -227,6 +269,7 @@ impl EditorBuffer {
         line.insert(byte_idx, ch);
         self.cursor_col += 1;
         self.modified = true;
+        self.lsp_dirty = true;
     }
 
     // 删除光标前字符。
@@ -238,6 +281,7 @@ impl EditorBuffer {
             line.replace_range(start..end, "");
             self.cursor_col -= 1;
             self.modified = true;
+            self.lsp_dirty = true;
         } else if self.cursor_row > 0 {
             let current = self.lines.remove(self.cursor_row);
             self.cursor_row -= 1;
@@ -246,6 +290,7 @@ impl EditorBuffer {
             prev.push_str(&current);
             self.cursor_col = old_len;
             self.modified = true;
+            self.lsp_dirty = true;
         }
     }
 
@@ -258,6 +303,7 @@ impl EditorBuffer {
         self.cursor_col = 0;
         self.lines.insert(self.cursor_row, rest);
         self.modified = true;
+        self.lsp_dirty = true;
     }
 
     // 获取当前单词前缀。
@@ -285,6 +331,7 @@ impl EditorBuffer {
         line.replace_range(start_byte..end_byte, replacement);
         self.cursor_col = start + replacement.chars().count();
         self.modified = true;
+        self.lsp_dirty = true;
     }
 
     // 保存缓冲区内容到文件。

@@ -32,7 +32,7 @@ pub(super) fn contains_point(area: Rect, x: u16, y: u16) -> bool {
 pub(super) fn is_normal_command_prefix(prefix: &str) -> bool {
     const COMMANDS: &[&str] = &[
         "fs", "fl", "sv", "sp", "sh", "sl", "sj", "sk", "tn", "tl", "th", "tb", "tc", "tt",
-        "te", "e", "pi", "pu", "ci", "cu", "w", "q", "fa", "ff", "fh", "fc", "fb", "[g",
+        "te", "e", "pi", "pu", "ci", "cu", "w", "q", "fa", "ff", "fh", "fc", "lc", "fb", "[g",
         "]g", "K",
     ];
     COMMANDS.iter().any(|cmd| cmd.starts_with(prefix))
