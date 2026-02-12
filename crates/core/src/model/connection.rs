@@ -81,7 +81,6 @@ pub struct Connection {
     api_key: String,
     agent_select: String,
     support_tools: bool,
-    client: Option<BuiltClient>,
 }
 
 impl Connection {
@@ -99,7 +98,6 @@ impl Connection {
             api_key,
             agent_select,
             support_tools,
-            client: None,
         }
     }
 
@@ -198,7 +196,7 @@ impl Connection {
             Provider::Codex => {
                 // Codex 默认优先读取 `CODEX_API_KEY`，以便与通用 `OPENAI_API_KEY` 并存。
                 // 若未设置，则回退到 `OPENAI_API_KEY`，降低迁移成本。
-                // 使用 CompletionsClient 而非 ResponsesClient，因为大多数 Codex 兼容端点不支持 Responses API。
+                // 使用 Chat Completions API，兼容性更好。
                 let api_key = self.resolve_api_key(&["CODEX_API_KEY", "OPENAI_API_KEY"])?;
                 let mut builder = openai::CompletionsClient::builder().api_key(api_key);
                 if let Some(base_url) = custom_base_url.as_ref() {
@@ -261,15 +259,9 @@ impl Connection {
         }
     }
 
-    /// 对外响应接口：懒加载 client 后发送 prompt。
+    /// 对外响应接口：每次请求都重新构建 client，避免状态复用问题。
     pub async fn response(&mut self, prompt: String) -> Result<String> {
-        if self.client.is_none() {
-            self.client = Some(self.builder()?);
-        }
-
-        match self.client.as_ref() {
-            Some(client) => client.prompt(prompt).await,
-            None => Err(anyhow!("client 未初始化")),
-        }
+        let client = self.builder()?;
+        client.prompt(prompt).await
     }
 }

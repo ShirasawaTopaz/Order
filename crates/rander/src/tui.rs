@@ -15,17 +15,18 @@ use core::{
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
 };
 use serde::{Deserialize, Serialize};
-use std::{error::Error,
+use std::{
     env, fs,
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
+use unicode_width::UnicodeWidthStr;
 
 use ratatui::{
     DefaultTerminal, Frame,
@@ -151,6 +152,10 @@ pub struct OrderTui<'a> {
     ///
     /// 当该字段为 `Some` 时，主界面切换为历史会话列表浏览模式。
     history_browser: Option<HistoryBrowserState>,
+    /// 对话区域滚动偏移量。
+    ///
+    /// 0 表示显示最新消息（底部），大于 0 表示向上滚动的行数。
+    conversation_scroll: usize,
 }
 
 impl Default for OrderTui<'_> {
@@ -166,6 +171,7 @@ impl Default for OrderTui<'_> {
             messages: Vec::new(),
             session_timestamp: now.format("%Y-%-m-%-d %H:%M:%S").to_string(),
             history_browser: None,
+            conversation_scroll: 0,
         }
     }
 }
@@ -198,13 +204,19 @@ impl OrderTui<'_> {
                 .checked_sub(self.last_tick.elapsed())
                 .unwrap_or_else(|| Duration::from_secs(0));
 
-            if event::poll(timeout)?
-                && let Event::Key(key) = event::read()?
-            {
-                self.handle_key_event(&key);
-                self.process_pending_command(terminal)?;
-                self.input_state.set_cursor_visible(true);
-                self.last_tick = Instant::now();
+            if event::poll(timeout)? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        self.handle_key_event(&key);
+                        self.process_pending_command(terminal)?;
+                        self.input_state.set_cursor_visible(true);
+                        self.last_tick = Instant::now();
+                    }
+                    Event::Mouse(mouse) => {
+                        self.handle_mouse_event(&mouse);
+                    }
+                    _ => {}
+                }
             }
 
             if self.last_tick.elapsed() >= tick_rate {
@@ -418,6 +430,31 @@ impl OrderTui<'_> {
         }
     }
 
+    /// 处理鼠标事件。
+    ///
+    /// 支持操作：
+    /// - 鼠标滚轮向上：向上滚动对话区
+    /// - 鼠标滚轮向下：向下滚动对话区（向最新消息方向）
+    fn handle_mouse_event(&mut self, mouse: &MouseEvent) {
+        if self.history_browser.is_some() {
+            return;
+        }
+
+        if self.messages.is_empty() {
+            return;
+        }
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.conversation_scroll = self.conversation_scroll.saturating_add(3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.conversation_scroll = self.conversation_scroll.saturating_sub(3);
+            }
+            _ => {}
+        }
+    }
+
     /// 处理历史选择界面的按键事件。
     ///
     /// 支持按键：
@@ -506,6 +543,9 @@ impl OrderTui<'_> {
     fn process_plain_input(&mut self, input: String) {
         // 用户输入以对话形式展示在右侧。
         self.push_chat_message(ChatRole::User, input.clone(), true);
+
+        // 发送新消息时重置滚动，显示最新内容。
+        self.conversation_scroll = 0;
 
         // 发送结果以对话形式展示：
         // - 成功：LLM 回复显示在左侧；
@@ -1236,9 +1276,9 @@ impl OrderTui<'_> {
         }
     }
 
-    /// 根据给定宽度将消息按字符分段换行。
+    /// 根据给定宽度将消息按显示宽度分段换行。
     ///
-    /// 这里按字符数近似宽度，足以满足当前终端对话显示需求。
+    /// 使用 unicode-width 计算实际显示宽度，正确处理中文字符（占2个显示宽度）。
     fn wrap_message(content: &str, width: usize) -> Vec<String> {
         if width == 0 {
             return Vec::new();
@@ -1252,15 +1292,16 @@ impl OrderTui<'_> {
             }
 
             let mut current = String::new();
-            let mut count = 0usize;
+            let mut current_width = 0usize;
             for ch in raw_line.chars() {
-                current.push(ch);
-                count += 1;
-                if count >= width {
+                let ch_width = UnicodeWidthStr::width(ch.to_string().as_str());
+                if current_width + ch_width > width && !current.is_empty() {
                     lines.push(current);
                     current = String::new();
-                    count = 0;
+                    current_width = 0;
                 }
+                current.push(ch);
+                current_width += ch_width;
             }
 
             if !current.is_empty() {
@@ -1314,7 +1355,8 @@ impl OrderTui<'_> {
                 };
 
                 let rendered = if is_right_aligned {
-                    let padding = width.saturating_sub(content.chars().count());
+                    let content_width = UnicodeWidthStr::width(content.as_str());
+                    let padding = width.saturating_sub(content_width);
                     format!("{}{}", " ".repeat(padding), content)
                 } else {
                     content
@@ -1381,16 +1423,29 @@ impl Widget for &OrderTui<'_> {
             chat_block.render(main_area, buf);
 
             if chat_inner.width > 0 && chat_inner.height > 0 {
-                let mut conversation_lines =
+                let conversation_lines =
                     self.build_conversation_lines(chat_inner.width as usize);
 
                 let max_visible_lines = chat_inner.height as usize;
-                if conversation_lines.len() > max_visible_lines {
-                    let start = conversation_lines.len().saturating_sub(max_visible_lines);
-                    conversation_lines = conversation_lines.into_iter().skip(start).collect();
-                }
+                let total_lines = conversation_lines.len();
 
-                Paragraph::new(Text::from(conversation_lines)).render(chat_inner, buf);
+                if total_lines > max_visible_lines {
+                    // 计算起始位置：从末尾往前推，再减去滚动偏移量
+                    // conversation_scroll = 0 时显示最新消息
+                    // conversation_scroll > 0 时向上滚动
+                    let max_scroll = total_lines.saturating_sub(max_visible_lines);
+                    let effective_scroll = self.conversation_scroll.min(max_scroll);
+                    let start = max_scroll.saturating_sub(effective_scroll);
+                    
+                    let visible_lines: Vec<_> = conversation_lines
+                        .into_iter()
+                        .skip(start)
+                        .take(max_visible_lines)
+                        .collect();
+                    Paragraph::new(Text::from(visible_lines)).render(chat_inner, buf);
+                } else {
+                    Paragraph::new(Text::from(conversation_lines)).render(chat_inner, buf);
+                }
             }
 
             InputWidget::new(&self.input_state)
