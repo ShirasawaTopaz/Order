@@ -1,5 +1,5 @@
-use std::cmp::min;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use std::cmp::min;
 use std::sync::OnceLock;
 
 use lsp::LspSemanticToken;
@@ -70,7 +70,10 @@ impl Editor {
             } else {
                 Style::default().fg(palette.dim)
             };
-            spans.push(Span::styled(format!(" [{}:{}] ", idx + 1, tab.title), style));
+            spans.push(Span::styled(
+                format!(" [{}:{}] ", idx + 1, tab.title),
+                style,
+            ));
         }
         Paragraph::new(Line::from(spans)).render(area, frame.buffer_mut());
     }
@@ -85,11 +88,7 @@ impl Editor {
         );
         let inner = block.inner(area);
         block
-            .border_style(Style::default().fg(if focused {
-                palette.accent
-            } else {
-                palette.dim
-            }))
+            .border_style(Style::default().fg(if focused { palette.accent } else { palette.dim }))
             .render(area, frame.buffer_mut());
         if inner.width == 0 || inner.height == 0 {
             return;
@@ -109,7 +108,11 @@ impl Editor {
             let item = &self.tree_entries[idx];
             let indent = "  ".repeat(item.depth);
             let icon = if item.is_dir { "[D]" } else { "[F]" };
-            let mut style = Style::default().fg(if item.is_dir { palette.warn } else { palette.fg });
+            let mut style = Style::default().fg(if item.is_dir {
+                palette.warn
+            } else {
+                palette.fg
+            });
             if idx == self.tree_selected {
                 style = style
                     .bg(if focused { palette.accent } else { palette.dim })
@@ -125,14 +128,19 @@ impl Editor {
         Paragraph::new(lines).render(inner, frame.buffer_mut());
     }
 
-    pub(super) fn render_divider(&self, frame: &mut Frame, main: Rect, tree_width: u16, palette: ThemePalette) {
+    pub(super) fn render_divider(
+        &self,
+        frame: &mut Frame,
+        main: Rect,
+        tree_width: u16,
+        palette: ThemePalette,
+    ) {
         if tree_width == 0 || tree_width >= main.width {
             return;
         }
         let x = main.x + tree_width.saturating_sub(1);
         for y in main.y..(main.y + main.height) {
-            frame
-                .buffer_mut()[(x, y)]
+            frame.buffer_mut()[(x, y)]
                 .set_char('|')
                 .set_fg(palette.dim)
                 .set_bg(palette.bg);
@@ -152,7 +160,10 @@ impl Editor {
 
         if self.mode == EditorMode::Terminal {
             Paragraph::new(vec![
-                Line::from(Span::styled("Terminal mode", Style::default().fg(palette.ok))),
+                Line::from(Span::styled(
+                    "Terminal mode",
+                    Style::default().fg(palette.ok),
+                )),
                 Line::from(Span::styled(
                     "Use <C-\\><C-n> back to NORMAL",
                     Style::default().fg(palette.dim),
@@ -186,13 +197,7 @@ impl Editor {
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .split(editor_area);
-                self.render_editor_pane(
-                    frame,
-                    panes[0],
-                    PaneFocus::Primary,
-                    active_focus,
-                    palette,
-                );
+                self.render_editor_pane(frame, panes[0], PaneFocus::Primary, active_focus, palette);
                 self.render_editor_pane(
                     frame,
                     panes[1],
@@ -206,13 +211,7 @@ impl Editor {
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .split(editor_area);
-                self.render_editor_pane(
-                    frame,
-                    panes[0],
-                    PaneFocus::Primary,
-                    active_focus,
-                    palette,
-                );
+                self.render_editor_pane(frame, panes[0], PaneFocus::Primary, active_focus, palette);
                 self.render_editor_pane(
                     frame,
                     panes[1],
@@ -286,8 +285,11 @@ impl Editor {
             let line = &buffer.lines[row];
 
             if is_markdown {
-                let (mut highlighted, next_state) =
-                    Self::highlight_markdown_line(line, palette, markdown_fence_language.as_deref());
+                let (mut highlighted, next_state) = Self::highlight_markdown_line(
+                    line,
+                    palette,
+                    markdown_fence_language.as_deref(),
+                );
                 markdown_fence_language = next_state;
                 spans.append(&mut highlighted);
             } else if is_rust {
@@ -331,8 +333,7 @@ impl Editor {
                         .chars()
                         .nth(buffer.cursor_col)
                         .unwrap_or(' ');
-                    frame
-                        .buffer_mut()[(cursor_x, cursor_y)]
+                    frame.buffer_mut()[(cursor_x, cursor_y)]
                         .set_char(cursor_char)
                         .set_bg(palette.accent)
                         .set_fg(Color::Black);
@@ -384,11 +385,8 @@ impl Editor {
     /// - Rust 语义高亮由 rust-analyzer 提供，符合用户要求；
     /// - token 未返回时回退普通文本，避免闪烁和错色。
     fn can_use_lsp_semantic_highlight(buffer: &EditorBuffer) -> bool {
-        let is_supported_language = lsp::detect_language_from_path_or_name(
-            buffer.path.as_deref(),
-            &buffer.name,
-        )
-        .is_some();
+        let is_supported_language =
+            lsp::detect_language_from_path_or_name(buffer.path.as_deref(), &buffer.name).is_some();
         is_supported_language && !buffer.lsp_tokens_by_line.is_empty()
     }
 
@@ -404,7 +402,10 @@ impl Editor {
         palette: ThemePalette,
     ) -> Vec<Span<'static>> {
         if tokens.is_empty() {
-            return vec![Span::styled(line.to_string(), Style::default().fg(palette.fg))];
+            return vec![Span::styled(
+                line.to_string(),
+                Style::default().fg(palette.fg),
+            )];
         }
 
         let mut spans = Vec::new();
@@ -413,7 +414,9 @@ impl Editor {
 
         for token in tokens {
             let token_start = token.start.min(line_char_count);
-            let token_end = token_start.saturating_add(token.length).min(line_char_count);
+            let token_end = token_start
+                .saturating_add(token.length)
+                .min(line_char_count);
             if token_start > current_char {
                 let plain_start = super::char_to_byte_index_in_line(line, current_char);
                 let plain_end = super::char_to_byte_index_in_line(line, token_start);
@@ -449,7 +452,10 @@ impl Editor {
         }
 
         if spans.is_empty() {
-            spans.push(Span::styled(line.to_string(), Style::default().fg(palette.fg)));
+            spans.push(Span::styled(
+                line.to_string(),
+                Style::default().fg(palette.fg),
+            ));
         }
         spans
     }
@@ -459,22 +465,32 @@ impl Editor {
     /// 映射优先考虑“结构可读性”：关键字/函数/类型/变量保持稳定对比。
     fn semantic_token_style(token: &LspSemanticToken, palette: ThemePalette) -> Style {
         let mut style = match token.token_type.as_str() {
-            "keyword" => Style::default().fg(palette.accent).add_modifier(Modifier::BOLD),
+            "keyword" => Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
             "string" => Style::default().fg(palette.ok),
             "number" => Style::default().fg(palette.warn),
             "function" | "method" => Style::default().fg(Color::Rgb(130, 170, 255)),
-            "type" | "struct" | "class" | "enum" | "interface" => {
-                Style::default().fg(Color::Rgb(255, 203, 107)).add_modifier(Modifier::BOLD)
-            }
+            "type" | "struct" | "class" | "enum" | "interface" => Style::default()
+                .fg(Color::Rgb(255, 203, 107))
+                .add_modifier(Modifier::BOLD),
             "parameter" => Style::default().fg(Color::Rgb(199, 146, 234)),
             "property" | "field" => Style::default().fg(Color::Rgb(128, 203, 196)),
-            "macro" => Style::default().fg(Color::Rgb(255, 158, 128)).add_modifier(Modifier::BOLD),
-            "comment" => Style::default().fg(palette.dim).add_modifier(Modifier::ITALIC),
+            "macro" => Style::default()
+                .fg(Color::Rgb(255, 158, 128))
+                .add_modifier(Modifier::BOLD),
+            "comment" => Style::default()
+                .fg(palette.dim)
+                .add_modifier(Modifier::ITALIC),
             "operator" => Style::default().fg(palette.accent),
             _ => Style::default().fg(palette.fg),
         };
 
-        if token.token_modifiers.iter().any(|item| item == "deprecated") {
+        if token
+            .token_modifiers
+            .iter()
+            .any(|item| item == "deprecated")
+        {
             style = style.add_modifier(Modifier::CROSSED_OUT);
         }
         if token.token_modifiers.iter().any(|item| item == "readonly") {
@@ -646,7 +662,9 @@ impl Editor {
             return (
                 vec![Span::styled(
                     line.to_string(),
-                    Style::default().fg(palette.dim).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(palette.dim)
+                        .add_modifier(Modifier::BOLD),
                 )],
                 None,
             );
@@ -676,7 +694,9 @@ impl Editor {
             return (
                 vec![Span::styled(
                     line.to_string(),
-                    Style::default().fg(palette.dim).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(palette.dim)
+                        .add_modifier(Modifier::ITALIC),
                 )],
                 None,
             );
@@ -687,7 +707,9 @@ impl Editor {
             return (
                 vec![Span::styled(
                     line.to_string(),
-                    Style::default().fg(palette.warn).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(palette.warn)
+                        .add_modifier(Modifier::BOLD),
                 )],
                 None,
             );
@@ -703,7 +725,10 @@ impl Editor {
                         Style::default().fg(palette.warn),
                     ));
                 } else {
-                    spans.push(Span::styled(ch.to_string(), Style::default().fg(palette.fg)));
+                    spans.push(Span::styled(
+                        ch.to_string(),
+                        Style::default().fg(palette.fg),
+                    ));
                 }
             }
             return (spans, None);
@@ -728,7 +753,10 @@ impl Editor {
             };
             return (
                 vec![
-                    Span::styled(format!("{} [{}] ", bullet, if checked { "x" } else { " " }), marker_style),
+                    Span::styled(
+                        format!("{} [{}] ", bullet, if checked { "x" } else { " " }),
+                        marker_style,
+                    ),
                     Span::styled(content.to_string(), content_style),
                 ],
                 None,
@@ -782,7 +810,10 @@ impl Editor {
             }
         }
 
-        (Self::highlight_markdown_line_with_parser(line, palette), None)
+        (
+            Self::highlight_markdown_line_with_parser(line, palette),
+            None,
+        )
     }
 
     pub(super) fn render_tagbar(&self, frame: &mut Frame, area: Rect, palette: ThemePalette) {
@@ -848,7 +879,12 @@ impl Editor {
             .render(area, frame.buffer_mut());
     }
 
-    pub(super) fn render_buffer_picker(&self, frame: &mut Frame, area: Rect, palette: ThemePalette) {
+    pub(super) fn render_buffer_picker(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        palette: ThemePalette,
+    ) {
         let width = min(60, area.width.saturating_sub(4));
         let height = min(16, area.height.saturating_sub(4));
         let popup = Rect {
@@ -884,7 +920,10 @@ impl Editor {
     /// - 使用 `into_offset_iter` 获取事件对应的源码字节区间；
     /// - 在“源码文本”上着色，保证语法标记字符（如 `**`、`[]()`）不丢失；
     /// - 支持复杂转义、嵌套边界、脚注、表格、HTML block 等标准解析能力。
-    fn highlight_markdown_line_with_parser(line: &str, palette: ThemePalette) -> Vec<Span<'static>> {
+    fn highlight_markdown_line_with_parser(
+        line: &str,
+        palette: ThemePalette,
+    ) -> Vec<Span<'static>> {
         if line.is_empty() {
             return vec![Span::styled(String::new(), Style::default().fg(palette.fg))];
         }
@@ -914,7 +953,8 @@ impl Editor {
                 }
                 Event::End(tag_end) => {
                     let parent = *style_stack.last().unwrap_or(&default_style);
-                    let marker_style = Self::markdown_marker_style_for_tag_end(tag_end, palette, parent);
+                    let marker_style =
+                        Self::markdown_marker_style_for_tag_end(tag_end, palette, parent);
                     Self::apply_style_to_range(&mut byte_styles, range, marker_style);
                     if style_stack.len() > 1 {
                         style_stack.pop();
@@ -925,11 +965,15 @@ impl Editor {
                     Self::apply_style_to_range(&mut byte_styles, range, current);
                 }
                 Event::Code(_) => {
-                    let style = Style::default().fg(palette.warn).add_modifier(Modifier::BOLD);
+                    let style = Style::default()
+                        .fg(palette.warn)
+                        .add_modifier(Modifier::BOLD);
                     Self::apply_style_to_range(&mut byte_styles, range, style);
                 }
                 Event::Html(_) | Event::InlineHtml(_) => {
-                    let style = Style::default().fg(palette.dim).add_modifier(Modifier::ITALIC);
+                    let style = Style::default()
+                        .fg(palette.dim)
+                        .add_modifier(Modifier::ITALIC);
                     Self::apply_style_to_range(&mut byte_styles, range, style);
                 }
                 Event::FootnoteReference(_) => {
@@ -939,7 +983,9 @@ impl Editor {
                     Self::apply_style_to_range(&mut byte_styles, range, style);
                 }
                 Event::Rule => {
-                    let style = Style::default().fg(palette.dim).add_modifier(Modifier::BOLD);
+                    let style = Style::default()
+                        .fg(palette.dim)
+                        .add_modifier(Modifier::BOLD);
                     Self::apply_style_to_range(&mut byte_styles, range, style);
                 }
                 Event::TaskListMarker(done) => {
@@ -963,7 +1009,11 @@ impl Editor {
     }
 
     /// 将样式应用到指定源码字节区间。
-    fn apply_style_to_range(byte_styles: &mut [Style], range: std::ops::Range<usize>, style: Style) {
+    fn apply_style_to_range(
+        byte_styles: &mut [Style],
+        range: std::ops::Range<usize>,
+        style: Style,
+    ) {
         if range.start >= range.end || range.start >= byte_styles.len() {
             return;
         }
@@ -986,7 +1036,12 @@ impl Editor {
         let mut start = 0usize;
         let mut current_style = byte_styles[0];
 
-        for (index, style) in byte_styles.iter().enumerate().skip(1).take(line.len().saturating_sub(1)) {
+        for (index, style) in byte_styles
+            .iter()
+            .enumerate()
+            .skip(1)
+            .take(line.len().saturating_sub(1))
+        {
             if *style != current_style {
                 if let Some(segment) = line.get(start..index)
                     && !segment.is_empty()
@@ -1022,7 +1077,9 @@ impl Editor {
                 base.fg(palette.accent).add_modifier(Modifier::UNDERLINED)
             }
             Tag::BlockQuote(_) => base.fg(palette.dim).add_modifier(Modifier::ITALIC),
-            Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell => base.fg(palette.warn),
+            Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell => {
+                base.fg(palette.warn)
+            }
             Tag::FootnoteDefinition(_) => base.fg(palette.accent),
             _ => base,
         }
@@ -1077,7 +1134,9 @@ impl Editor {
             TagEnd::Emphasis => base.fg(palette.ok).add_modifier(Modifier::ITALIC),
             TagEnd::Strong => base.fg(palette.ok).add_modifier(Modifier::BOLD),
             TagEnd::Strikethrough => base.fg(palette.dim).add_modifier(Modifier::CROSSED_OUT),
-            TagEnd::Link | TagEnd::Image => base.fg(palette.accent).add_modifier(Modifier::UNDERLINED),
+            TagEnd::Link | TagEnd::Image => {
+                base.fg(palette.accent).add_modifier(Modifier::UNDERLINED)
+            }
             TagEnd::BlockQuote(_) => base.fg(palette.dim).add_modifier(Modifier::ITALIC),
             TagEnd::Table | TagEnd::TableHead | TagEnd::TableRow | TagEnd::TableCell => {
                 base.fg(palette.warn)
@@ -1124,11 +1183,17 @@ impl Editor {
                     ));
                 }
                 if spans.is_empty() {
-                    spans.push(Span::styled(line.to_string(), Style::default().fg(palette.ok)));
+                    spans.push(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(palette.ok),
+                    ));
                 }
                 spans
             }
-            Err(_) => vec![Span::styled(line.to_string(), Style::default().fg(palette.ok))],
+            Err(_) => vec![Span::styled(
+                line.to_string(),
+                Style::default().fg(palette.ok),
+            )],
         }
     }
 
@@ -1137,10 +1202,16 @@ impl Editor {
         let foreground = style.foreground;
         let mut result = Style::default().fg(Color::Rgb(foreground.r, foreground.g, foreground.b));
 
-        if style.font_style.contains(syntect::highlighting::FontStyle::BOLD) {
+        if style
+            .font_style
+            .contains(syntect::highlighting::FontStyle::BOLD)
+        {
             result = result.add_modifier(Modifier::BOLD);
         }
-        if style.font_style.contains(syntect::highlighting::FontStyle::ITALIC) {
+        if style
+            .font_style
+            .contains(syntect::highlighting::FontStyle::ITALIC)
+        {
             result = result.add_modifier(Modifier::ITALIC);
         }
         if style

@@ -33,7 +33,7 @@ impl Default for LspClient {
 
 impl LspClient {
     /// 鍒涘缓绌哄鎴风锛屼笉浼氱珛鍗冲惎鍔ㄤ换浣曡瑷€鏈嶅姟銆?    
-pub fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
             status_message: "LSP 未启动".to_string(),
@@ -42,17 +42,17 @@ pub fn new() -> Self {
     }
 
     /// 鑾峰彇鐘舵€佹爮鏂囨湰銆?    
-pub fn status_message(&self) -> &str {
+    pub fn status_message(&self) -> &str {
         &self.status_message
     }
 
     /// 鑾峰彇鏈€杩戝姩浣滄弿杩般€?    
-pub fn last_action(&self) -> &str {
+    pub fn last_action(&self) -> &str {
         &self.last_action
     }
 
     /// 鏄惁瀛樺湪鑷冲皯涓€涓椿璺冧細璇濄€?    
-pub fn is_running(&self) -> bool {
+    pub fn is_running(&self) -> bool {
         self.sessions.values().any(|session| session.running)
     }
 
@@ -68,7 +68,7 @@ pub fn is_running(&self) -> bool {
 
     /// 妫€鏌ユ墍鏈夊彈鏀寔璇█鏈嶅姟鍣ㄦ槸鍚﹀彲鐢ㄣ€?    ///
     /// 璇ュ嚱鏁颁笉浼氬惎鍔ㄦ湇鍔″櫒杩涚▼锛屽彧閫氳繃绯荤粺 PATH 鍙墽琛屾€у仛蹇€熸帰娴嬨€?    
-pub fn check_server_availability(&self) -> LspServerCheckReport {
+    pub fn check_server_availability(&self) -> LspServerCheckReport {
         let mut items = Vec::new();
         for language in all_languages() {
             let (binary, _) = language.server_command();
@@ -84,7 +84,11 @@ pub fn check_server_availability(&self) -> LspServerCheckReport {
     }
 
     /// 鏍规嵁鏂囦欢璺緞纭繚璇█浼氳瘽宸插惎鍔ㄣ€?    
-pub fn ensure_started_for_file(&mut self, workspace_root: &Path, file_path: &Path) -> Result<()> {
+    pub fn ensure_started_for_file(
+        &mut self,
+        workspace_root: &Path,
+        file_path: &Path,
+    ) -> Result<()> {
         let Some(language) = detect_language(file_path) else {
             return Ok(());
         };
@@ -92,7 +96,7 @@ pub fn ensure_started_for_file(&mut self, workspace_root: &Path, file_path: &Pat
     }
 
     /// 纭繚鎸囧畾璇█浼氳瘽宸插惎鍔ㄣ€?    
-pub fn ensure_started_for_language(
+    pub fn ensure_started_for_language(
         &mut self,
         workspace_root: &Path,
         language: LspLanguage,
@@ -124,7 +128,7 @@ pub fn ensure_started_for_language(
     }
 
     /// 鍚屾浼氳瘽瀛樻椿鐘舵€併€?    
-pub fn sync_running_state(&mut self) -> Result<()> {
+    pub fn sync_running_state(&mut self) -> Result<()> {
         let mut exited_languages = Vec::new();
         for (language, session) in &mut self.sessions {
             if !session.sync_running_state()? {
@@ -139,7 +143,7 @@ pub fn sync_running_state(&mut self) -> Result<()> {
     }
 
     /// 鎷夊彇鎵€鏈変細璇濅簨浠躲€?    
-pub fn poll_events(&mut self) -> Vec<LspEvent> {
+    pub fn poll_events(&mut self) -> Vec<LspEvent> {
         let mut events = self.drain_session_events();
         for event in &events {
             match event {
@@ -182,7 +186,7 @@ pub fn poll_events(&mut self) -> Vec<LspEvent> {
     }
 
     /// 鍙戦€?`textDocument/didOpen`銆?    
-pub fn send_did_open(
+    pub fn send_did_open(
         &mut self,
         workspace_root: &Path,
         file_path: &Path,
@@ -220,7 +224,7 @@ pub fn send_did_open(
     }
 
     /// 鍙戦€?`textDocument/didClose`銆?    
-pub fn send_did_close(&mut self, file_path: &Path) -> Result<()> {
+    pub fn send_did_close(&mut self, file_path: &Path) -> Result<()> {
         let Some(language) = detect_language(file_path) else {
             return Ok(());
         };
@@ -243,7 +247,7 @@ pub fn send_did_close(&mut self, file_path: &Path) -> Result<()> {
     }
 
     /// 鍙戦€?`textDocument/didSave`銆?    
-pub fn send_did_save(&mut self, file_path: &Path, text: &str) -> Result<()> {
+    pub fn send_did_save(&mut self, file_path: &Path, text: &str) -> Result<()> {
         let Some(language) = detect_language(file_path) else {
             return Ok(());
         };
@@ -267,7 +271,7 @@ pub fn send_did_save(&mut self, file_path: &Path, text: &str) -> Result<()> {
     }
 
     /// 鍙戦€?`textDocument/didChange`銆?    
-pub fn send_did_change(
+    pub fn send_did_change(
         &mut self,
         file_path: &Path,
         old_text: &str,
@@ -284,18 +288,20 @@ pub fn send_did_change(
         let file_uri = protocol::path_to_file_uri(file_path)
             .with_context(|| format!("didChange 璺緞杞崲澶辫触: {}", file_path.display()))?;
 
-        let mut content_changes: Vec<Value> = protocol::compute_incremental_changes(old_text, new_text)
-            .into_iter()
-            .map(|change| {
-                serde_json::json!({
-                    "range": {
-                        "start": { "line": change.start_line, "character": change.start_character },
-                        "end": { "line": change.end_line, "character": change.end_character }
-                    },
-                    "text": change.new_text
-                })
+        let mut content_changes: Vec<Value> = protocol::compute_incremental_changes(
+            old_text, new_text,
+        )
+        .into_iter()
+        .map(|change| {
+            serde_json::json!({
+                "range": {
+                    "start": { "line": change.start_line, "character": change.start_character },
+                    "end": { "line": change.end_line, "character": change.end_character }
+                },
+                "text": change.new_text
             })
-            .collect();
+        })
+        .collect();
 
         if content_changes.is_empty() {
             self.last_action = format!("didChange(noop:{})", language.language_id());
@@ -322,7 +328,7 @@ pub fn send_did_change(
     }
 
     /// 鍙戦€?`textDocument/willSave`銆?    
-pub fn send_will_save(&mut self, file_path: &Path) -> Result<()> {
+    pub fn send_will_save(&mut self, file_path: &Path) -> Result<()> {
         let Some(language) = detect_language(file_path) else {
             return Ok(());
         };
@@ -347,7 +353,7 @@ pub fn send_will_save(&mut self, file_path: &Path) -> Result<()> {
     }
 
     /// 鍙戦€?`textDocument/willSaveWaitUntil` 璇锋眰銆?    
-pub fn send_will_save_wait_until(&mut self, file_path: &Path) -> Result<()> {
+    pub fn send_will_save_wait_until(&mut self, file_path: &Path) -> Result<()> {
         let Some(language) = detect_language(file_path) else {
             return Ok(());
         };
@@ -355,8 +361,12 @@ pub fn send_will_save_wait_until(&mut self, file_path: &Path) -> Result<()> {
             return Ok(());
         };
 
-        let file_uri = protocol::path_to_file_uri(file_path)
-            .with_context(|| format!("willSaveWaitUntil 璺緞杞崲澶辫触: {}", file_path.display()))?;
+        let file_uri = protocol::path_to_file_uri(file_path).with_context(|| {
+            format!(
+                "willSaveWaitUntil 璺緞杞崲澶辫触: {}",
+                file_path.display()
+            )
+        })?;
         let request_id = session.next_request_id();
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -377,7 +387,7 @@ pub fn send_will_save_wait_until(&mut self, file_path: &Path) -> Result<()> {
     }
 
     /// 璇锋眰琛ュ叏銆?    
-pub fn request_completion(
+    pub fn request_completion(
         &mut self,
         file_path: &Path,
         line: usize,
@@ -418,7 +428,7 @@ pub fn request_completion(
     }
 
     /// 璇锋眰璇箟楂樹寒 token銆?    
-pub fn request_semantic_tokens(&mut self, file_path: &Path) -> Result<()> {
+    pub fn request_semantic_tokens(&mut self, file_path: &Path) -> Result<()> {
         let Some(language) = detect_language(file_path) else {
             return Ok(());
         };
@@ -447,7 +457,7 @@ pub fn request_semantic_tokens(&mut self, file_path: &Path) -> Result<()> {
     }
 
     /// 鍋滄鍏ㄩ儴浼氳瘽銆?    
-pub fn stop_all(&mut self) {
+    pub fn stop_all(&mut self) {
         for session in self.sessions.values_mut() {
             session.stop();
         }
@@ -490,7 +500,7 @@ struct LspSession {
 
 impl LspSession {
     /// 鍚姩浼氳瘽骞跺畬鎴愬垵濮嬪寲銆?    
-fn spawn(workspace_root: &Path, language: LspLanguage) -> Result<Self> {
+    fn spawn(workspace_root: &Path, language: LspLanguage) -> Result<Self> {
         let (binary, args) = language.server_command();
         let mut command = Command::new(binary);
         command
@@ -552,7 +562,7 @@ fn spawn(workspace_root: &Path, language: LspLanguage) -> Result<Self> {
     }
 
     /// 鍒锋柊璇诲彇绾跨▼娑堟伅锛屽苟鏄犲皠涓洪珮灞備簨浠躲€?    
-fn drain_reader_messages(&mut self) -> Vec<LspEvent> {
+    fn drain_reader_messages(&mut self) -> Vec<LspEvent> {
         let mut events = Vec::new();
 
         loop {
@@ -575,7 +585,7 @@ fn drain_reader_messages(&mut self) -> Vec<LspEvent> {
     }
 
     /// 灏嗗搷搴旀槧灏勪负楂樺眰浜嬩欢銆?    
-fn map_response(&mut self, response: Value) -> Option<LspEvent> {
+    fn map_response(&mut self, response: Value) -> Option<LspEvent> {
         let request_id = protocol::response_request_id(&response)?;
 
         if self.initialize_request_id == Some(request_id) {
@@ -631,9 +641,13 @@ fn map_response(&mut self, response: Value) -> Option<LspEvent> {
     }
 
     /// 鍙戦€佸垵濮嬪寲鎻℃墜銆?    
-fn send_initialize_sequence(&mut self, workspace_root: &Path) -> Result<()> {
-        let root_uri = protocol::path_to_file_uri(workspace_root)
-            .with_context(|| format!("宸ヤ綔鍖鸿矾寰勬棤娉曡浆鎹负 URI: {}", workspace_root.display()))?;
+    fn send_initialize_sequence(&mut self, workspace_root: &Path) -> Result<()> {
+        let root_uri = protocol::path_to_file_uri(workspace_root).with_context(|| {
+            format!(
+                "宸ヤ綔鍖鸿矾寰勬棤娉曡浆鎹负 URI: {}",
+                workspace_root.display()
+            )
+        })?;
 
         let initialize_request_id = self.next_request_id();
         self.initialize_request_id = Some(initialize_request_id);
@@ -721,7 +735,7 @@ fn send_initialize_sequence(&mut self, workspace_root: &Path) -> Result<()> {
     }
 
     /// 鍚屾杩涚▼鐘舵€併€?    
-fn sync_running_state(&mut self) -> Result<bool> {
+    fn sync_running_state(&mut self) -> Result<bool> {
         let Some(child) = self.child.as_mut() else {
             self.running = false;
             return Ok(false);
@@ -745,7 +759,7 @@ fn sync_running_state(&mut self) -> Result<bool> {
     }
 
     /// 鍋滄浼氳瘽銆?    
-fn stop(&mut self) {
+    fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -756,7 +770,7 @@ fn stop(&mut self) {
     }
 
     /// 鍏煎浜嬩欢閫氶亾鐨勯潪闃诲璇诲彇銆?    
-fn drain_legacy_events(&mut self) -> Option<LspEvent> {
+    fn drain_legacy_events(&mut self) -> Option<LspEvent> {
         let rx = self.event_rx.as_ref()?;
         match rx.try_recv() {
             Ok(event) => Some(event),
@@ -830,7 +844,7 @@ fn spawn_reader_thread(
 
 impl LspClient {
     /// 浠庡悇浼氳瘽璇诲彇绾跨▼涓彁鍙栧苟鍚堝苟浜嬩欢銆?    
-fn drain_session_events(&mut self) -> Vec<LspEvent> {
+    fn drain_session_events(&mut self) -> Vec<LspEvent> {
         let mut events = Vec::new();
         for session in self.sessions.values_mut() {
             events.extend(session.drain_reader_messages());
@@ -874,7 +888,7 @@ mod tests {
 
     /// 鏋勯€犱竴涓渶灏忎細璇濓紝鐢ㄤ簬楠岃瘉 initialize 涓?semanticTokens 鐨勫搷搴斾覆鑱斻€?    ///
     /// 杩欓噷涓嶅惎鍔ㄧ湡瀹炶瑷€鏈嶅姟锛岃€屾槸鐩存帴鍠傚叆 JSON-RPC 鍝嶅簲锛?    /// 杩欐牱鍙互绋冲畾澶嶇幇鈥渓egend 鏄犲皠閿欒瀵艰嚧楂樹寒澶辨晥鈥濈殑鍥炲綊鍦烘櫙銆?    
-fn build_minimal_session() -> LspSession {
+    fn build_minimal_session() -> LspSession {
         let (_reader_tx, reader_rx) = mpsc::channel::<ReaderMessage>();
         let mut pending_semantic_tokens = HashMap::new();
         pending_semantic_tokens.insert(2, PathBuf::from("main.rs"));
@@ -919,7 +933,10 @@ fn build_minimal_session() -> LspSession {
         });
 
         assert!(session.map_response(initialize_response).is_none());
-        assert_eq!(session.semantic_token_types, vec!["macro".to_string(), "parameter".to_string()]);
+        assert_eq!(
+            session.semantic_token_types,
+            vec!["macro".to_string(), "parameter".to_string()]
+        );
 
         let semantic_response = json!({
             "jsonrpc": "2.0",
@@ -969,4 +986,3 @@ fn build_minimal_session() -> LspSession {
         assert!(session.initialized);
     }
 }
-

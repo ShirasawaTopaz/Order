@@ -7,7 +7,10 @@ use std::{
 use super::{MAX_TREE_ENTRIES, types::TreeEntry, utils::file_name_or};
 
 // 根据展开状态收集目录树节点。
-pub(super) fn collect_tree_entries(root: &Path, expanded_dirs: &BTreeSet<PathBuf>) -> Vec<TreeEntry> {
+pub(super) fn collect_tree_entries(
+    root: &Path,
+    expanded_dirs: &BTreeSet<PathBuf>,
+) -> Vec<TreeEntry> {
     let mut entries = Vec::new();
     collect_tree_entries_recursive(root, 0, expanded_dirs, &mut entries);
     entries
@@ -32,7 +35,10 @@ fn collect_tree_entries_recursive(
     let mut entries = Vec::new();
     for entry in read_dir.flatten() {
         let entry_path = entry.path();
-        let is_dir = entry.file_type().map(|file_type| file_type.is_dir()).unwrap_or(false);
+        let is_dir = entry
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false);
         let name = file_name_or(entry_path.as_path(), "").to_string();
         if name.is_empty() {
             continue;

@@ -7,7 +7,9 @@ use std::{
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::types::{DiagnosticItem, DiagnosticSeverity, LspCompletionItem, LspSemanticToken, LspTextEdit};
+use crate::types::{
+    DiagnosticItem, DiagnosticSeverity, LspCompletionItem, LspSemanticToken, LspTextEdit,
+};
 
 /// 从 LSP 输出流读取下一条 JSON-RPC 消息。
 ///
@@ -58,9 +60,7 @@ pub fn send_message(stdin: &mut ChildStdin, value: &Value) -> Result<()> {
     stdin
         .write_all(header.as_bytes())
         .context("写入 LSP 消息头失败")?;
-    stdin
-        .write_all(&payload)
-        .context("写入 LSP 消息体失败")?;
+    stdin.write_all(&payload).context("写入 LSP 消息体失败")?;
     stdin.flush().context("刷新 LSP 输出流失败")
 }
 
@@ -114,7 +114,9 @@ pub fn parse_publish_diagnostics(value: &Value) -> (Option<PathBuf>, Vec<Diagnos
             .unwrap_or(0)
             .saturating_add(1);
 
-        let file_path = file_path.clone().unwrap_or_else(|| PathBuf::from("<unknown>"));
+        let file_path = file_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("<unknown>"));
         items.push(DiagnosticItem {
             file_path,
             line,
@@ -390,7 +392,10 @@ pub fn compute_incremental_changes(old_text: &str, new_text: &str) -> Vec<LspTex
     let new_lines: Vec<&str> = new_text.split('\n').collect();
 
     let mut prefix = 0usize;
-    while prefix < old_lines.len() && prefix < new_lines.len() && old_lines[prefix] == new_lines[prefix] {
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
         prefix += 1;
     }
 

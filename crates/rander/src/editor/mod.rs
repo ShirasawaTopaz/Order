@@ -156,7 +156,9 @@ impl Editor {
                 .unwrap_or(Duration::ZERO);
             if event::poll(timeout)? {
                 match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key_event(key),
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        self.handle_key_event(key)
+                    }
                     Event::Mouse(mouse) => self.handle_mouse_event(mouse),
                     _ => {}
                 }
@@ -193,10 +195,7 @@ impl Editor {
 
             let next_version = buffer.lsp_version.saturating_add(1);
             let text = buffer.lines.join("\n");
-            let old_text = buffer
-                .lsp_last_synced_text
-                .as_deref()
-                .unwrap_or("");
+            let old_text = buffer.lsp_last_synced_text.as_deref().unwrap_or("");
             match self
                 .lsp_client
                 .send_did_change(path, old_text, &text, next_version)
@@ -226,7 +225,10 @@ impl Editor {
                 LspEvent::Status(text) => {
                     self.status_message = text;
                 }
-                LspEvent::PublishDiagnostics { file_path: _, items } => {
+                LspEvent::PublishDiagnostics {
+                    file_path: _,
+                    items,
+                } => {
                     self.apply_lsp_diagnostics(items);
                 }
                 LspEvent::WillSaveWaitUntilEdits { file_path, edits } => {
@@ -373,7 +375,11 @@ impl Editor {
     }
 
     /// 将 `willSaveWaitUntil` 返回的 TextEdit 应用到目标缓冲区。
-    fn apply_will_save_wait_until_edits(&mut self, file_path: &std::path::Path, mut edits: Vec<LspTextEdit>) {
+    fn apply_will_save_wait_until_edits(
+        &mut self,
+        file_path: &std::path::Path,
+        mut edits: Vec<LspTextEdit>,
+    ) {
         if edits.is_empty() {
             return;
         }
@@ -397,11 +403,13 @@ impl Editor {
 
         let mut text = self.buffers[buffer_idx].lines.join("\n");
         for edit in edits {
-            let Some(start_byte) = line_col_to_byte_index(&text, edit.start_line, edit.start_character)
+            let Some(start_byte) =
+                line_col_to_byte_index(&text, edit.start_line, edit.start_character)
             else {
                 continue;
             };
-            let Some(end_byte) = line_col_to_byte_index(&text, edit.end_line, edit.end_character) else {
+            let Some(end_byte) = line_col_to_byte_index(&text, edit.end_line, edit.end_character)
+            else {
                 continue;
             };
             if start_byte > end_byte || end_byte > text.len() {

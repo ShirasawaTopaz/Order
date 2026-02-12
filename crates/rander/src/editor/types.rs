@@ -344,8 +344,13 @@ impl EditorBuffer {
                 generated
             }
         };
-        fs::write(&path, self.lines.join("
-"))?;
+        fs::write(
+            &path,
+            self.lines.join(
+                "
+",
+            ),
+        )?;
         self.modified = false;
         Ok(path)
     }

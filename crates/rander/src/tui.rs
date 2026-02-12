@@ -19,6 +19,7 @@ use crossterm::{
     },
     execute,
 };
+use rig::completion::Message as RigMessage;
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
@@ -264,7 +265,13 @@ impl OrderTui<'_> {
         match self.probe_codex_availability(&codex_model, &codex_base_url) {
             Ok(Some(api_key)) => {
                 let config_path = self.model_config_path()?;
-                self.write_model_config_file(&config_path, "codex", &codex_model, &codex_base_url, &api_key)?;
+                self.write_model_config_file(
+                    &config_path,
+                    "codex",
+                    &codex_model,
+                    &codex_base_url,
+                    &api_key,
+                )?;
                 self.connection = None;
 
                 // 立刻刷新一次，让用户看到 Model 面板变化（`codex/<model>`）。
@@ -272,7 +279,13 @@ impl OrderTui<'_> {
             }
             Ok(None) => {
                 let config_path = self.model_config_path()?;
-                self.write_model_config_file(&config_path, "codex", &codex_model, &codex_base_url, "")?;
+                self.write_model_config_file(
+                    &config_path,
+                    "codex",
+                    &codex_model,
+                    &codex_base_url,
+                    "",
+                )?;
                 self.connection = None;
 
                 // 无可用 Key 时仍给出默认 Codex 配置，避免“未配置模型”导致无法发送。
@@ -290,7 +303,13 @@ impl OrderTui<'_> {
                 // 探测失败时仍写入默认配置，避免阻塞启动流程。
                 // 这样做的原因：网络问题或 API 暂时不可用不应阻止用户使用 Order。
                 let config_path = self.model_config_path()?;
-                self.write_model_config_file(&config_path, "codex", &codex_model, &codex_base_url, "")?;
+                self.write_model_config_file(
+                    &config_path,
+                    "codex",
+                    &codex_model,
+                    &codex_base_url,
+                    "",
+                )?;
                 self.connection = None;
 
                 // 给出友好提示，说明探测失败但已写入默认配置。
@@ -714,7 +733,13 @@ impl OrderTui<'_> {
         let probe_result = self.probe_codex_availability(&codex_model, &codex_base_url);
         match probe_result {
             Ok(Some(api_key)) => {
-                self.write_model_config_file(&config_path, "codex", &codex_model, &codex_base_url, &api_key)?;
+                self.write_model_config_file(
+                    &config_path,
+                    "codex",
+                    &codex_model,
+                    &codex_base_url,
+                    &api_key,
+                )?;
                 // 清空缓存连接，确保后续发送走新配置。
                 self.connection = None;
 
@@ -750,7 +775,11 @@ impl OrderTui<'_> {
     /// - `Ok(Some(api_key))`：探测请求成功，返回可用的 API Key；
     /// - `Ok(None)`：未发现可用于探测的 API Key，直接跳过；
     /// - `Err(_)`：已尝试调用但失败（含超时、鉴权失败、模型不可用等）。
-    fn probe_codex_availability(&self, model_name: &str, api_url: &str) -> anyhow::Result<Option<String>> {
+    fn probe_codex_availability(
+        &self,
+        model_name: &str,
+        api_url: &str,
+    ) -> anyhow::Result<Option<String>> {
         // 优先读取环境变量；若不存在则尝试复用“当前模型配置”的 token。
         //
         // 这样做的原因：用户可能把 key 写在 `.order/model.json` 里而不是环境变量里，
@@ -856,11 +885,13 @@ impl OrderTui<'_> {
     /// 将用户输入发送给当前配置的大模型。
     ///
     /// 设计说明：
-    /// - 复用 `Connection` 实例，保证 `Connection` 内部懒加载的 `client` 能被持续复用；
+    /// - 复用 `Connection` 配置对象，但每次请求重建底层 `client`，避免 tools 在旧 runtime 上失效；
+    /// - 每次请求都显式携带历史消息，避免模型把当前输入当作“全新会话”；
     /// - 当前事件循环是同步的，因此这里用一个轻量 `tokio` 运行时阻塞等待异步响应；
     /// - 成功时返回响应文本，供对话区展示。
     fn send_prompt_to_llm(&mut self, prompt: String) -> anyhow::Result<String> {
         self.ensure_connection()?;
+        let chat_history = self.build_chat_history_for_llm(&prompt);
 
         let connection = self
             .connection
@@ -873,7 +904,7 @@ impl OrderTui<'_> {
             .context("创建异步运行时失败")?;
 
         runtime
-            .block_on(connection.response(prompt))
+            .block_on(connection.response_with_history(prompt, chat_history))
             .map_err(|e| {
                 let mut full_msg = e.to_string();
                 let mut source = e.source();
@@ -883,6 +914,54 @@ impl OrderTui<'_> {
                 }
                 anyhow::anyhow!("向 LLM 发送消息失败: {}", full_msg)
             })
+    }
+
+    /// 构建发送给 LLM 的历史上下文。
+    ///
+    /// 关键策略：
+    /// - 仅保留真实会话消息（`persist_to_history = true`），避免把 `/history` 回显污染上下文；
+    /// - 跳过“当前这次用户输入”，因为它会作为 `prompt` 单独传入，避免重复；
+    /// - 忽略 `Error` 消息，避免把本地异常文案当成模型语义上下文；
+    /// - 限制历史条数，降低超长会话导致的上下文溢出风险。
+    fn build_chat_history_for_llm(&self, current_prompt: &str) -> Vec<RigMessage> {
+        const MAX_HISTORY_MESSAGES_FOR_LLM: usize = 120;
+
+        let latest_user_index = self
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, message)| {
+                message.persist_to_history
+                    && matches!(message.role, ChatRole::User)
+                    && message.content == current_prompt
+            })
+            .map(|(index, _)| index);
+
+        let mut history = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.persist_to_history)
+            .filter_map(|(index, message)| {
+                if Some(index) == latest_user_index {
+                    return None;
+                }
+
+                match message.role {
+                    ChatRole::User => Some(RigMessage::user(message.content.clone())),
+                    ChatRole::Llm => Some(RigMessage::assistant(message.content.clone())),
+                    ChatRole::Error => None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if history.len() > MAX_HISTORY_MESSAGES_FOR_LLM {
+            let overflow = history.len() - MAX_HISTORY_MESSAGES_FOR_LLM;
+            history.drain(0..overflow);
+        }
+
+        history
     }
 
     /// 向对话流追加一条消息。
@@ -1381,6 +1460,74 @@ impl OrderTui<'_> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chat_message(role: ChatRole, content: &str, persist_to_history: bool) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: content.to_string(),
+            persist_to_history,
+        }
+    }
+
+    #[test]
+    fn build_chat_history_should_skip_current_prompt_duplicate() {
+        let mut tui = OrderTui::default();
+        tui.messages
+            .push(chat_message(ChatRole::User, "第一问", true));
+        tui.messages
+            .push(chat_message(ChatRole::Llm, "第一答", true));
+        tui.messages
+            .push(chat_message(ChatRole::User, "第二问", true));
+
+        let history = tui.build_chat_history_for_llm("第二问");
+        assert_eq!(
+            history,
+            vec![RigMessage::user("第一问"), RigMessage::assistant("第一答")]
+        );
+    }
+
+    #[test]
+    fn build_chat_history_should_ignore_error_and_non_persistent_messages() {
+        let mut tui = OrderTui::default();
+        tui.messages
+            .push(chat_message(ChatRole::User, "问题", true));
+        tui.messages.push(chat_message(ChatRole::Llm, "回答", true));
+        tui.messages
+            .push(chat_message(ChatRole::Error, "临时错误", true));
+        tui.messages
+            .push(chat_message(ChatRole::User, "仅回显消息", false));
+        tui.messages
+            .push(chat_message(ChatRole::User, "新问题", true));
+
+        let history = tui.build_chat_history_for_llm("新问题");
+        assert_eq!(
+            history,
+            vec![RigMessage::user("问题"), RigMessage::assistant("回答")]
+        );
+    }
+
+    #[test]
+    fn build_chat_history_should_limit_history_size() {
+        let mut tui = OrderTui::default();
+        for index in 0..130 {
+            tui.messages
+                .push(chat_message(ChatRole::User, &format!("u{index}"), true));
+            tui.messages
+                .push(chat_message(ChatRole::Llm, &format!("a{index}"), true));
+        }
+        tui.messages
+            .push(chat_message(ChatRole::User, "当前问题", true));
+
+        let history = tui.build_chat_history_for_llm("当前问题");
+        assert_eq!(history.len(), 120);
+        assert_eq!(history.first(), Some(&RigMessage::user("u70")));
+        assert_eq!(history.last(), Some(&RigMessage::assistant("a129")));
+    }
+}
+
 impl Widget for &OrderTui<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let input_height = self.input_state.required_height(area.width);
@@ -1423,8 +1570,7 @@ impl Widget for &OrderTui<'_> {
             chat_block.render(main_area, buf);
 
             if chat_inner.width > 0 && chat_inner.height > 0 {
-                let conversation_lines =
-                    self.build_conversation_lines(chat_inner.width as usize);
+                let conversation_lines = self.build_conversation_lines(chat_inner.width as usize);
 
                 let max_visible_lines = chat_inner.height as usize;
                 let total_lines = conversation_lines.len();
@@ -1436,7 +1582,7 @@ impl Widget for &OrderTui<'_> {
                     let max_scroll = total_lines.saturating_sub(max_visible_lines);
                     let effective_scroll = self.conversation_scroll.min(max_scroll);
                     let start = max_scroll.saturating_sub(effective_scroll);
-                    
+
                     let visible_lines: Vec<_> = conversation_lines
                         .into_iter()
                         .skip(start)

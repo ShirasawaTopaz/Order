@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use rig::{
     agent::Agent,
     client::CompletionClient,
-    completion::Prompt,
+    completion::{Chat, Message, Prompt},
     providers::{
         anthropic::{self, completion::CompletionModel as AnthropicCompletionModel},
         gemini::{self, CompletionModel as GeminiCompletionModel},
@@ -67,6 +67,36 @@ impl BuiltClient {
                 .map_err(|error| anyhow!(error.to_string())),
             BuiltClient::OpenAIAPI(client) => client
                 .prompt(prompt)
+                .await
+                .map_err(|error| anyhow!(error.to_string())),
+        }
+    }
+
+    /// 使用统一入口发送“带历史”的对话请求。
+    ///
+    /// 为什么要单独提供该接口：
+    /// - `prompt` 是单轮请求，不会自动携带以往消息；
+    /// - 当前 TUI 需要显式传入历史，才能避免“每次都像新会话”。
+    pub async fn chat(&self, prompt: String, history: Vec<Message>) -> Result<String> {
+        match self {
+            BuiltClient::OpenAI(client) => client
+                .chat(prompt, history)
+                .await
+                .map_err(|error| anyhow!(error.to_string())),
+            BuiltClient::Codex(client) => client
+                .chat(prompt, history)
+                .await
+                .map_err(|error| anyhow!(error.to_string())),
+            BuiltClient::Claude(client) => client
+                .chat(prompt, history)
+                .await
+                .map_err(|error| anyhow!(error.to_string())),
+            BuiltClient::Gemini(client) => client
+                .chat(prompt, history)
+                .await
+                .map_err(|error| anyhow!(error.to_string())),
+            BuiltClient::OpenAIAPI(client) => client
+                .chat(prompt, history)
                 .await
                 .map_err(|error| anyhow!(error.to_string())),
         }
@@ -259,9 +289,25 @@ impl Connection {
         }
     }
 
-    /// 对外响应接口：每次请求都重新构建 client，避免状态复用问题。
+    /// 对外响应接口：发送单轮请求。
     pub async fn response(&mut self, prompt: String) -> Result<String> {
+        // 这里按请求重建客户端，而不是跨请求缓存。
+        //
+        // 原因：当启用 tools 时，rig 内部 ToolServer 通过 `tokio::spawn` 绑定在当前 runtime；
+        // 如果在“每次请求新建 runtime”的上层调用模式下复用旧 client，第二轮很容易出现
+        // `Failed to get tool definitions`（旧 runtime 已结束，tool handle 失效）。
         let client = self.builder()?;
         client.prompt(prompt).await
+    }
+
+    /// 对外响应接口：发送带历史的多轮请求。
+    pub async fn response_with_history(
+        &mut self,
+        prompt: String,
+        history: Vec<Message>,
+    ) -> Result<String> {
+        // 与 `response` 保持一致：每轮重建，避免 tool server 绑定到已销毁 runtime。
+        let client = self.builder()?;
+        client.chat(prompt, history).await
     }
 }

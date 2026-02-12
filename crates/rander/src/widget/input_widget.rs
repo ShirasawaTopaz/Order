@@ -11,7 +11,10 @@ pub const AVAILABLE_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show help information"),
     ("/exit", "Exit the application"),
     ("/cancel", "Cancel latest operation"),
-    ("/history", "Open history browser; support /history N, /history clear"),
+    (
+        "/history",
+        "Open history browser; support /history N, /history clear",
+    ),
     ("/skills", "Manage project skills"),
     ("/rules", "Edit project rules"),
     ("/settings", "Configure settings"),

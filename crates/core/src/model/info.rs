@@ -89,9 +89,7 @@ pub fn get_current_model_info() -> Result<Option<ModelInfo>> {
     {
         // 当配置文件的 token 为空且 provider 为 codex/openai 时，
         // 尝试从 Codex CLI 配置补充 token 和 api_url
-        if model.token.trim().is_empty()
-            && is_openai_like_provider(&model.provider_name)
-        {
+        if model.token.trim().is_empty() && is_openai_like_provider(&model.provider_name) {
             if let Some(codex_config) = load_codex_cli_config() {
                 if model.token.trim().is_empty() {
                     model.token = codex_config.token;
@@ -658,8 +656,22 @@ mod tests {
             println!("[TEST] Codex CLI config loaded:");
             println!("  provider: {}", model.provider_name);
             println!("  model: {}", model.model_name);
-            println!("  token: {}", if model.token.is_empty() { "EMPTY" } else { "SET" });
-            println!("  api_url: {}", if model.api_url.is_empty() { "EMPTY" } else { &model.api_url });
+            println!(
+                "  token: {}",
+                if model.token.is_empty() {
+                    "EMPTY"
+                } else {
+                    "SET"
+                }
+            );
+            println!(
+                "  api_url: {}",
+                if model.api_url.is_empty() {
+                    "EMPTY"
+                } else {
+                    &model.api_url
+                }
+            );
             assert!(!model.token.is_empty(), "Token should not be empty");
         } else {
             println!("[TEST] No Codex CLI config found (this is expected if not configured)");
@@ -672,8 +684,22 @@ mod tests {
             println!("[TEST] Current model info:");
             println!("  provider: {}", model.provider_name);
             println!("  model: {}", model.model_name);
-            println!("  token: {}", if model.token.is_empty() { "EMPTY" } else { "SET" });
-            println!("  api_url: {}", if model.api_url.is_empty() { "EMPTY" } else { &model.api_url });
+            println!(
+                "  token: {}",
+                if model.token.is_empty() {
+                    "EMPTY"
+                } else {
+                    "SET"
+                }
+            );
+            println!(
+                "  api_url: {}",
+                if model.api_url.is_empty() {
+                    "EMPTY"
+                } else {
+                    &model.api_url
+                }
+            );
         } else {
             println!("[TEST] No model info available");
         }

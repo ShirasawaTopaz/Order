@@ -201,7 +201,10 @@ impl LspLanguage {
 
 /// 根据路径识别语言。
 pub fn detect_language(path: &Path) -> Option<LspLanguage> {
-    let extension = path.extension().and_then(|ext| ext.to_str())?.to_ascii_lowercase();
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())?
+        .to_ascii_lowercase();
     match extension.as_str() {
         "rs" => Some(LspLanguage::Rust),
         "py" => Some(LspLanguage::Python),

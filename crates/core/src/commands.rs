@@ -22,7 +22,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub fn match_command(&mut self,command: String) {
+    pub fn match_command(&mut self, command: String) {
         if command.is_empty() {
             *self = Command::Unknown;
         }
@@ -40,7 +40,6 @@ impl Command {
         };
     }
     pub fn execute(&self) {
-        if let Command::Exit = self {
-        }
+        if let Command::Exit = self {}
     }
 }
