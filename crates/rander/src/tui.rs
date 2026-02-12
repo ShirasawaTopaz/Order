@@ -9,7 +9,7 @@ use core::{
     commands::{EXIT, get_exit},
     model::{
         connection::{Connection, Provider},
-        info::get_current_model_info,
+        info::{get_current_model_info, get_current_model_info_from_config},
     },
 };
 use crossterm::{
@@ -20,8 +20,8 @@ use crossterm::{
     execute,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
+use std::{error::Error,
+    env, fs,
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
@@ -175,6 +175,21 @@ impl OrderTui<'_> {
         // 启用鼠标捕获，主界面和 editor 会共享鼠标事件能力。
         execute!(std::io::stdout(), EnableMouseCapture)?;
 
+        // 先渲染一次主界面，避免启动阶段的 Codex 探测阻塞导致黑屏。
+        terminal.draw(|frame| self.draw(frame))?;
+
+        // 启动后默认尝试使用 Codex：
+        // - 仅当用户未提供任何模型配置文件时才触发（避免覆盖用户偏好）；
+        // - 探测失败不影响主流程，仅作为“尽量启用 Codex”的优化路径。
+        if let Err(error) = self.try_auto_configure_codex_on_startup(terminal) {
+            // 在 TUI 模式下直接弹错误消息会打断主界面体验，
+            // 因此这里只做轻量日志，方便排查即可。
+            eprintln!("auto configure codex failed: {error}");
+        }
+
+        // 若启动探测发生阻塞，需要重置闪烁时钟，避免首帧就快速闪烁。
+        self.last_tick = Instant::now();
+
         let tick_rate = Duration::from_millis(500);
         while !get_exit().load(Ordering::Relaxed) {
             terminal.draw(|frame| self.draw(frame))?;
@@ -201,6 +216,129 @@ impl OrderTui<'_> {
         execute!(std::io::stdout(), DisableMouseCapture)?;
         terminal.clear()?;
         Ok(())
+    }
+
+    /// 启动时尝试启用 Codex，并在可用时落盘到 `.order/model.json`。
+    ///
+    /// 设计目标：
+    /// - “默认尝试 Codex”，让首次启动即具备更强的编码模型能力；
+    /// - 不破坏用户显式配置：只在未检测到任何模型配置文件时才自动写入；
+    /// - 写入后立即刷新界面，让 `Model` 面板反映最新配置。
+    fn try_auto_configure_codex_on_startup(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+    ) -> anyhow::Result<()> {
+        if self.has_any_model_config_file()? {
+            return Ok(());
+        }
+
+        let codex_model = env::var("CODEX_MODEL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        let codex_base_url = env::var("CODEX_BASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                env::var("OPENAI_BASE_URL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .unwrap_or_default();
+
+        // 启动阶段希望尽量让 Codex 成为默认模型，但又要区分"无 Key"与"探测失败"两类场景：
+        // - 无 Key：仍写入默认配置，便于用户补充 Key 后直接使用；
+        // - 探测失败（网络/API 错误）：仍写入默认配置，避免阻塞启动，但给出友好提示。
+        match self.probe_codex_availability(&codex_model, &codex_base_url) {
+            Ok(Some(api_key)) => {
+                let config_path = self.model_config_path()?;
+                self.write_model_config_file(&config_path, "codex", &codex_model, &codex_base_url, &api_key)?;
+                self.connection = None;
+
+                // 立刻刷新一次，让用户看到 Model 面板变化（`codex/<model>`）。
+                terminal.draw(|frame| self.draw(frame))?;
+            }
+            Ok(None) => {
+                let config_path = self.model_config_path()?;
+                self.write_model_config_file(&config_path, "codex", &codex_model, &codex_base_url, "")?;
+                self.connection = None;
+
+                // 无可用 Key 时仍给出默认 Codex 配置，避免“未配置模型”导致无法发送。
+                self.push_chat_message(
+                    ChatRole::Error,
+                    "未检测到可用的 OpenAI Key（CODEX_API_KEY / OPENAI_API_KEY），已写入默认 Codex 配置，请补充 Key 后重试"
+                        .to_string(),
+                    false,
+                );
+
+                // 刷新界面，展示最新模型与提示信息。
+                terminal.draw(|frame| self.draw(frame))?;
+            }
+            Err(error) => {
+                // 探测失败时仍写入默认配置，避免阻塞启动流程。
+                // 这样做的原因：网络问题或 API 暂时不可用不应阻止用户使用 Order。
+                let config_path = self.model_config_path()?;
+                self.write_model_config_file(&config_path, "codex", &codex_model, &codex_base_url, "")?;
+                self.connection = None;
+
+                // 给出友好提示，说明探测失败但已写入默认配置。
+                self.push_chat_message(
+                    ChatRole::Error,
+                    format!(
+                        "Codex 探测失败（{}），已写入默认配置。请检查网络或 API Key 后重试",
+                        error
+                    ),
+                    false,
+                );
+
+                // 刷新界面，展示最新模型与提示信息。
+                terminal.draw(|frame| self.draw(frame))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 判断用户是否已提供“任何形式”的模型配置文件。
+    ///
+    /// 之所以不直接调用 `get_current_model_info()`：
+    /// - 该函数会在环境变量存在时生成兜底模型；
+    /// - 启动自动写配置时，我们只想在“完全没有配置文件”的情况下触发。
+    fn has_any_model_config_file(&self) -> anyhow::Result<bool> {
+        // 若用户通过环境变量显式指定了 provider/model，也视为“已有配置”。
+        // 这样做可以避免启动时自动写配置干扰容器/CI 场景下的环境变量驱动配置。
+        let read_non_empty_env = |key: &str| -> Option<String> {
+            env::var(key)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        let explicit_provider = read_non_empty_env("ORDER_MODEL_PROVIDER")
+            .or_else(|| read_non_empty_env("ORDER_PROVIDER"));
+        let explicit_model =
+            read_non_empty_env("ORDER_MODEL_NAME").or_else(|| read_non_empty_env("ORDER_MODEL"));
+        if explicit_provider.is_some() && explicit_model.is_some() {
+            return Ok(true);
+        }
+
+        if let Ok(explicit_path) = env::var("ORDER_MODEL_CONFIG") {
+            let path = explicit_path.trim();
+            if !path.is_empty() && PathBuf::from(path).exists() {
+                return Ok(true);
+            }
+        }
+
+        match get_current_model_info_from_config() {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => {}
+            Err(error) => {
+                // 配置文件可能为空或已损坏，此时允许继续自动探测，
+                // 以免“有文件但无可用模型”导致启动后无法启用 Codex。
+                eprintln!("invalid model config ignored during startup: {error}");
+            }
+        }
+
+        Ok(false)
     }
 
     fn draw(&self, frame: &mut Frame) {
@@ -376,7 +514,19 @@ impl OrderTui<'_> {
         match self.send_prompt_to_llm(input) {
             Ok(response) => self.push_chat_message(ChatRole::Llm, response, true),
             Err(error) => {
-                self.push_chat_message(ChatRole::Error, format!("发送失败：{error}"), true);
+                let error_msg = error.to_string();
+                if error_msg.contains("API Key 未配置") {
+                    self.push_chat_message(
+                        ChatRole::Error,
+                        format!(
+                            "{}\n\n配置方式：\n1. 设置环境变量 CODEX_API_KEY 或 OPENAI_API_KEY\n2. 或在 .order/model.json 中设置 token 字段",
+                            error_msg
+                        ),
+                        true,
+                    );
+                } else {
+                    self.push_chat_message(ChatRole::Error, format!("发送失败：{error}"), true);
+                }
             }
         }
     }
@@ -395,6 +545,21 @@ impl OrderTui<'_> {
         match command {
             "/editor" => self.launch_editor(terminal)?,
             "/exit" => self.exit.store(true, Ordering::Relaxed),
+            "/settings" => {
+                // 配置入口：默认探测 Codex，并在可用时写入模型配置文件。
+                //
+                // 之所以做成显式命令而不是启动即探测：
+                // - 避免每次启动都产生额外的网络请求和模型消耗；
+                // - 由用户主动触发更可控，也更符合“配置”这一语义。
+                let force = segments
+                    .next()
+                    .map(|value| value.eq_ignore_ascii_case("force"))
+                    .unwrap_or(false);
+
+                if let Err(error) = self.configure_model_with_codex(force, terminal) {
+                    self.push_chat_message(ChatRole::Error, format!("配置失败：{error}"), false);
+                }
+            }
             "/history" => {
                 match segments.next() {
                     Some(argument) if argument.eq_ignore_ascii_case("clear") => {
@@ -459,6 +624,195 @@ impl OrderTui<'_> {
         Ok(())
     }
 
+    /// 生成/更新模型配置：优先尝试 Codex。
+    ///
+    /// 规则：
+    /// - 默认不覆盖已有 `.order/model.json`；需要用户显式传入 `force` 才允许覆盖；
+    /// - 仅当探测到 Codex 可正常调用时才写入配置，避免把用户带入“不可用模型”的坑；
+    /// - 写入后清空已缓存的 `Connection`，保证后续请求按新配置重建连接。
+    fn configure_model_with_codex(
+        &mut self,
+        force: bool,
+        terminal: &mut DefaultTerminal,
+    ) -> anyhow::Result<()> {
+        let config_path = self.model_config_path()?;
+
+        if config_path.exists() && !force {
+            self.push_chat_message(
+                ChatRole::Llm,
+                format!(
+                    "检测到已有模型配置：{}；如需覆盖请使用 `/settings force`",
+                    config_path.display()
+                ),
+                false,
+            );
+            return Ok(());
+        }
+
+        let codex_model = env::var("CODEX_MODEL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        let codex_base_url = env::var("CODEX_BASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                env::var("OPENAI_BASE_URL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .unwrap_or_default();
+
+        self.push_chat_message(
+            ChatRole::Llm,
+            format!("正在探测 Codex 可用性（model={codex_model}）..."),
+            false,
+        );
+        // 先刷新一次界面，让用户看到“探测中”，再开始阻塞等待网络请求。
+        terminal.draw(|frame| self.draw(frame))?;
+
+        let probe_result = self.probe_codex_availability(&codex_model, &codex_base_url);
+        match probe_result {
+            Ok(Some(api_key)) => {
+                self.write_model_config_file(&config_path, "codex", &codex_model, &codex_base_url, &api_key)?;
+                // 清空缓存连接，确保后续发送走新配置。
+                self.connection = None;
+
+                self.push_chat_message(
+                    ChatRole::Llm,
+                    format!(
+                        "Codex 可用：已写入配置 {}，Model 面板将自动更新",
+                        config_path.display()
+                    ),
+                    false,
+                );
+            }
+            Ok(None) => {
+                self.push_chat_message(
+                    ChatRole::Error,
+                    "未检测到可用的 OpenAI Key（CODEX_API_KEY / OPENAI_API_KEY / 当前配置 token），已跳过 Codex 配置"
+                        .to_string(),
+                    false,
+                );
+            }
+            Err(error) => {
+                // 探测失败时不写配置：用户仍可继续使用当前配置或其它 provider。
+                self.push_chat_message(ChatRole::Error, format!("Codex 不可用：{error}"), false);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 探测 Codex 是否可调用。
+    ///
+    /// 返回值：
+    /// - `Ok(Some(api_key))`：探测请求成功，返回可用的 API Key；
+    /// - `Ok(None)`：未发现可用于探测的 API Key，直接跳过；
+    /// - `Err(_)`：已尝试调用但失败（含超时、鉴权失败、模型不可用等）。
+    fn probe_codex_availability(&self, model_name: &str, api_url: &str) -> anyhow::Result<Option<String>> {
+        // 优先读取环境变量；若不存在则尝试复用“当前模型配置”的 token。
+        //
+        // 这样做的原因：用户可能把 key 写在 `.order/model.json` 里而不是环境变量里，
+        // 配置命令应尽量减少额外的手工迁移成本。
+        let env_api_key = env::var("CODEX_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                env::var("OPENAI_API_KEY")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            });
+
+        let api_key = if let Some(value) = env_api_key {
+            value
+        } else if let Ok(Some(model_info)) = get_current_model_info() {
+            let provider = model_info.provider_name.trim().to_ascii_lowercase();
+            let is_openai_like = matches!(
+                provider.as_str(),
+                "openai" | "codex" | "openaiapi" | "openai_api"
+            );
+            if is_openai_like && !model_info.token.trim().is_empty() {
+                model_info.token
+            } else {
+                return Ok(None);
+            }
+        } else {
+            return Ok(None);
+        };
+
+        // 探测仅用于确认模型是否可用，因此关闭 tools，避免产生不必要的工具协商开销。
+        let mut connection = Connection::new(
+            Provider::Codex,
+            api_url.to_string(),
+            api_key.clone(),
+            model_name.to_string(),
+            false,
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("创建异步运行时失败")?;
+
+        let probe_result = runtime.block_on(async {
+            // 使用超时包裹，避免网络异常导致配置流程卡死。
+            tokio::time::timeout(
+                Duration::from_secs(12),
+                connection.response("请只回复 OK".to_string()),
+            )
+            .await
+        });
+
+        match probe_result {
+            Ok(Ok(_)) => Ok(Some(api_key)),
+            Ok(Err(error)) => Err(error).context("Codex 探测请求失败"),
+            Err(_) => Err(anyhow!("Codex 探测超时（12s）")),
+        }
+    }
+
+    /// 写入模型配置文件（UTF-8 JSON + LF）。
+    ///
+    /// 目前固定写到 `.order/model.json`，并启用 `support_tools`，让 Codex 更像“编码助手”。
+    fn write_model_config_file(
+        &self,
+        config_path: &PathBuf,
+        provider: &str,
+        model: &str,
+        api_url: &str,
+        token: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
+        }
+
+        let value = serde_json::json!({
+            "current": {
+                "provider": provider,
+                "model": model,
+                "api_url": api_url,
+                "token": token,
+                "support_tools": true,
+                "model_max_context": 0,
+                "model_max_output": 0,
+                "model_max_tokens": 0
+            },
+            "models": []
+        });
+        let mut content = serde_json::to_string_pretty(&value).context("序列化模型配置失败")?;
+        content.push('\n');
+
+        fs::write(config_path, content)
+            .with_context(|| format!("写入模型配置失败: {}", config_path.display()))
+    }
+
+    /// 计算模型配置文件路径：运行目录下的 `.order/model.json`。
+    fn model_config_path(&self) -> anyhow::Result<PathBuf> {
+        let current_dir = env::current_dir().context("获取运行目录失败")?;
+        Ok(current_dir.join(".order").join("model.json"))
+    }
+
     /// 将用户输入发送给当前配置的大模型。
     ///
     /// 设计说明：
@@ -480,7 +834,15 @@ impl OrderTui<'_> {
 
         runtime
             .block_on(connection.response(prompt))
-            .context("向 LLM 发送消息失败")
+            .map_err(|e| {
+                let mut full_msg = e.to_string();
+                let mut source = e.source();
+                while let Some(err) = source {
+                    full_msg.push_str(&format!("\n  原因: {}", err));
+                    source = err.source();
+                }
+                anyhow::anyhow!("向 LLM 发送消息失败: {}", full_msg)
+            })
     }
 
     /// 向对话流追加一条消息。
@@ -1055,8 +1417,9 @@ impl Widget for &OrderTui<'_> {
         )])]);
         Paragraph::new(welcome_text).render(welcome_area, buf);
 
-        let model_name = if let Ok(Some(model_info)) = get_current_model_info() {
-            model_info.model_name
+        let model_label = if let Ok(Some(model_info)) = get_current_model_info() {
+            // 显示 provider + model，便于用户快速确认当前走的是哪条连接链路。
+            format!("{}/{}", model_info.provider_name, model_info.model_name)
         } else {
             "None".to_string()
         };
@@ -1067,7 +1430,7 @@ impl Widget for &OrderTui<'_> {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(model_name, Style::default().fg(Color::Green)),
+            Span::styled(model_label, Style::default().fg(Color::Green)),
         ])]);
         let model_block = Block::bordered().border_style(Style::default().fg(Color::DarkGray));
         Paragraph::new(model_text)

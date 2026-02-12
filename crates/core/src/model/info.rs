@@ -76,18 +76,57 @@ pub fn get_user_model_info_list() -> Result<Option<ModelInfoList>> {
 /// 1. `ORDER_MODEL_*` 显式环境变量；
 /// 2. 配置文件中的 `current` / `current_model` / 首个模型；
 /// 3. Provider 通用环境变量兜底。
+///
+/// 特殊处理：当配置文件的 token 为空且 provider 为 codex/openai 时，
+/// 尝试从 Codex CLI 配置补充 token 和 api_url。
 pub fn get_current_model_info() -> Result<Option<ModelInfo>> {
     if let Some(model) = load_explicit_model_from_env() {
         return Ok(Some(model));
     }
 
     if let Some(config) = load_model_config_file()?
-        && let Some(model) = select_current_model(config)
+        && let Some(mut model) = select_current_model(config)
     {
+        // 当配置文件的 token 为空且 provider 为 codex/openai 时，
+        // 尝试从 Codex CLI 配置补充 token 和 api_url
+        if model.token.trim().is_empty()
+            && is_openai_like_provider(&model.provider_name)
+        {
+            if let Some(codex_config) = load_codex_cli_config() {
+                if model.token.trim().is_empty() {
+                    model.token = codex_config.token;
+                }
+                if model.api_url.trim().is_empty() {
+                    model.api_url = codex_config.api_url;
+                }
+            }
+        }
         return Ok(Some(model));
     }
 
     Ok(load_fallback_model_from_provider_env())
+}
+
+/// 判断 provider 是否为 OpenAI 兼容类型。
+fn is_openai_like_provider(provider_name: &str) -> bool {
+    matches!(
+        provider_name.trim().to_ascii_lowercase().as_str(),
+        "openai" | "codex" | "openaiapi" | "openai_api"
+    )
+}
+
+/// 仅从配置文件中读取当前模型信息，不使用任何环境变量兜底。
+///
+/// 设计原因：
+/// - 启动阶段需要判断“是否已有可用配置文件”，避免被环境变量干扰；
+/// - 若直接使用 `get_current_model_info()`，会把临时环境兜底模型当成已有配置，
+///   导致自动探测 Codex 被错误跳过。
+pub fn get_current_model_info_from_config() -> Result<Option<ModelInfo>> {
+    if let Some(config) = load_model_config_file()? {
+        return Ok(select_current_model(config));
+    }
+
+    Ok(None)
 }
 
 /// 解析配置文件并返回“当前模型 + 模型列表”。
@@ -154,7 +193,12 @@ fn load_explicit_model_from_env() -> Option<ModelInfo> {
 /// - 若存在 API Key，默认给出常见模型名；
 /// - 模型名可通过 provider 对应环境变量覆盖。
 fn load_fallback_model_from_provider_env() -> Option<ModelInfo> {
-    // Codex 作为 OpenAI 的“编码型”模型常被单独配置。
+    // 优先尝试读取本地 Codex CLI 配置
+    if let Some(model) = load_codex_cli_config() {
+        return Some(model);
+    }
+
+    // Codex 作为 OpenAI 的"编码型"模型常被单独配置。
     // 优先读取 `CODEX_API_KEY`，避免与通用 OpenAI 配置互相覆盖。
     if let Ok(token) = env::var("CODEX_API_KEY")
         && !token.trim().is_empty()
@@ -465,6 +509,102 @@ fn first_non_empty_env(keys: &[&str]) -> Option<String> {
     })
 }
 
+/// 从本地 Codex CLI 配置目录读取模型信息。
+///
+/// Codex CLI 配置文件位置：
+/// - Windows: `%USERPROFILE%\.codex\`
+/// - Unix: `~/.codex/`
+///
+/// 配置文件：
+/// - `auth.json`: `{ "OPENAI_API_KEY": "xxx" }`
+/// - `config.toml`: 模型和 API URL 配置
+fn load_codex_cli_config() -> Option<ModelInfo> {
+    let codex_dir = if cfg!(windows) {
+        env::var("USERPROFILE")
+            .ok()
+            .map(|p| PathBuf::from(p).join(".codex"))
+    } else {
+        env::var("HOME")
+            .ok()
+            .map(|p| PathBuf::from(p).join(".codex"))
+    };
+
+    let codex_dir = codex_dir.filter(|p| p.exists())?;
+
+    let token = load_codex_auth_json(&codex_dir)?;
+    let (model_name, api_url) = load_codex_config_toml(&codex_dir);
+
+    Some(ModelInfo {
+        api_url,
+        token,
+        model_name,
+        support_tools: false,
+        provider_name: "codex".to_string(),
+        model_max_context: 0,
+        model_max_output: 0,
+        model_max_tokens: 0,
+    })
+}
+
+/// 从 Codex CLI auth.json 读取 API Key。
+fn load_codex_auth_json(codex_dir: &PathBuf) -> Option<String> {
+    let auth_path = codex_dir.join("auth.json");
+    if !auth_path.exists() {
+        return None;
+    }
+
+    let content = fs::read_to_string(&auth_path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+
+    value
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+}
+
+/// 从 Codex CLI config.toml 读取模型名和 API URL。
+///
+/// 返回 (model_name, base_url)
+fn load_codex_config_toml(codex_dir: &PathBuf) -> (String, String) {
+    let config_path = codex_dir.join("config.toml");
+    if !config_path.exists() {
+        return ("gpt-5.3-codex".to_string(), String::new());
+    }
+
+    let content = match fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return ("gpt-5.3-codex".to_string(), String::new()),
+    };
+
+    let doc: toml::Value = match content.parse() {
+        Ok(d) => d,
+        Err(_) => return ("gpt-5.3-codex".to_string(), String::new()),
+    };
+
+    let model_name = doc
+        .get("model")
+        .and_then(toml::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("gpt-5.3-codex")
+        .to_string();
+
+    let model_provider = doc.get("model_provider").and_then(toml::Value::as_str);
+
+    let base_url = model_provider
+        .and_then(|provider| {
+            doc.get("model_providers")
+                .and_then(|providers| providers.get(provider))
+                .and_then(|p| p.get("base_url"))
+                .and_then(toml::Value::as_str)
+        })
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    (model_name, base_url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +650,33 @@ mod tests {
         assert!(parse_bool_text("1"));
         assert!(!parse_bool_text("false"));
         assert!(!parse_bool_text("0"));
+    }
+
+    #[test]
+    fn test_load_codex_cli_config() {
+        if let Some(model) = load_codex_cli_config() {
+            println!("[TEST] Codex CLI config loaded:");
+            println!("  provider: {}", model.provider_name);
+            println!("  model: {}", model.model_name);
+            println!("  token: {}", if model.token.is_empty() { "EMPTY" } else { "SET" });
+            println!("  api_url: {}", if model.api_url.is_empty() { "EMPTY" } else { &model.api_url });
+            assert!(!model.token.is_empty(), "Token should not be empty");
+        } else {
+            println!("[TEST] No Codex CLI config found (this is expected if not configured)");
+        }
+    }
+
+    #[test]
+    fn test_get_current_model_info_with_codex_fallback() {
+        if let Ok(Some(model)) = get_current_model_info() {
+            println!("[TEST] Current model info:");
+            println!("  provider: {}", model.provider_name);
+            println!("  model: {}", model.model_name);
+            println!("  token: {}", if model.token.is_empty() { "EMPTY" } else { "SET" });
+            println!("  api_url: {}", if model.api_url.is_empty() { "EMPTY" } else { &model.api_url });
+        } else {
+            println!("[TEST] No model info available");
+        }
     }
 
     #[test]

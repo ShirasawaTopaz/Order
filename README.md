@@ -47,6 +47,12 @@ cargo check --workspace
 
 其中 `/editor` 可进入内置编辑器视图。
 
+`/settings` 目前用于生成模型配置：
+
+- 启动时若未检测到任何模型配置文件，会默认探测 Codex；可用则自动写入 `.order/model.json`。
+- 默认探测 Codex 是否可用；若可用则写入 `.order/model.json`，并在主界面 `Model` 面板展示为 `codex/<model>`。
+- 若已存在配置文件且不想覆盖，可直接跳过；如需覆盖请使用 `/settings force`。
+
 ## 模型 Provider 与密钥
 
 `core` 中已支持以下 Provider 枚举：

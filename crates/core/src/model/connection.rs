@@ -39,7 +39,7 @@ pub enum Provider {
 #[derive(Clone)]
 pub enum BuiltClient {
     OpenAI(Agent<OpenAIResponsesCompletionModel>),
-    Codex(Agent<OpenAIResponsesCompletionModel>),
+    Codex(Agent<OpenAICompletionModel>),
     Claude(Agent<AnthropicCompletionModel>),
     Gemini(Agent<GeminiCompletionModel>),
     OpenAIAPI(Agent<OpenAICompletionModel>),
@@ -148,8 +148,8 @@ impl Connection {
 
         // 统一输出更明确的错误信息，方便用户一次性补齐环境变量。
         Err(anyhow!(
-            "{} 未设置且 connection.api_key 为空",
-            env_vars.join(" / ")
+            "API Key 未配置。请在配置文件中设置 token 字段，或设置环境变量 {}",
+            env_vars.join(" 或 ")
         ))
     }
 
@@ -198,15 +198,16 @@ impl Connection {
             Provider::Codex => {
                 // Codex 默认优先读取 `CODEX_API_KEY`，以便与通用 `OPENAI_API_KEY` 并存。
                 // 若未设置，则回退到 `OPENAI_API_KEY`，降低迁移成本。
+                // 使用 CompletionsClient 而非 ResponsesClient，因为大多数 Codex 兼容端点不支持 Responses API。
                 let api_key = self.resolve_api_key(&["CODEX_API_KEY", "OPENAI_API_KEY"])?;
-                let mut builder = openai::Client::builder().api_key(api_key);
+                let mut builder = openai::CompletionsClient::builder().api_key(api_key);
                 if let Some(base_url) = custom_base_url.as_ref() {
                     builder = builder.base_url(base_url);
                 }
 
                 let client = builder.build()?;
 
-                // Codex 的主要价值在于“带工具的编码工作流”，因此当用户开启时自动注入工具集。
+                // Codex 的主要价值在于"带工具的编码工作流"，因此当用户开启时自动注入工具集。
                 let agent = if self.support_tools() {
                     client
                         .agent(&self.agent_select)
