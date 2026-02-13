@@ -28,8 +28,8 @@ mod utils;
 use self::{
     tree::collect_tree_entries,
     types::{
-        EditorBuffer, EditorMode, MainFocus, PaneFocus, SplitDirection, TabState, ThemeName,
-        TreeEntry,
+        CompletionDisplayItem, EditorBuffer, EditorMode, MainFocus, PaneFocus, SplitDirection,
+        TabState, ThemeName, TreeEntry,
     },
 };
 
@@ -58,7 +58,7 @@ pub struct Editor {
     tabs: Vec<TabState>,
     active_tab: usize,
     show_tagbar: bool,
-    completion_items: Vec<String>,
+    completion_items: Vec<CompletionDisplayItem>,
     completion_selected: usize,
     theme: ThemeName,
     diagnostics: Vec<String>,
@@ -145,7 +145,7 @@ impl Editor {
                 self.status_message = format!("LSP 状态检查失败: {error}");
             }
 
-            self.auto_activate_rust_analyzer();
+            self.auto_activate_lsp();
             self.handle_lsp_events();
             self.lsp_last_action = self.lsp_client.last_action().to_string();
             self.sync_lsp_did_change();
@@ -265,36 +265,61 @@ impl Editor {
         }
     }
 
-    /// 自动激活 rust-analyzer。
+    /// 自动激活 LSP 语言服务。
     ///
-    /// 每轮主循环仅在“当前活跃 buffer 是 Rust 且会话未运行”时触发一次 didOpen，
+    /// 每轮主循环检查：
+    /// - 如果当前活跃 buffer 是某语言文件且会话未运行，触发 didOpen；
+    /// - 如果项目根目录存在该语言的项目标识文件且会话未运行，直接启动 LSP。
     /// 这样既能实现开箱即用自动激活，也避免重复请求造成噪音。
-    fn auto_activate_rust_analyzer(&mut self) {
+    fn auto_activate_lsp(&mut self) {
         if self.tabs.is_empty() {
             return;
         }
 
         let buffer_idx = self.tabs[self.active_tab].buffer_index;
-        let Some(path) = self
+        let buffer_path = self
             .buffers
             .get(buffer_idx)
-            .and_then(|buffer| buffer.path.as_ref().cloned())
-        else {
-            return;
-        };
+            .and_then(|buffer| buffer.path.as_ref().cloned());
 
-        let is_rust = detect_language_from_path_or_name(Some(&path), "")
-            .is_some_and(|language| language == lsp::LspLanguage::Rust);
-        if !is_rust {
-            return;
+        for language in lsp::all_languages() {
+            if self.lsp_client.is_language_running(*language) {
+                continue;
+            }
+
+            let has_project_marker = language
+                .project_markers()
+                .iter()
+                .any(|marker| self.root.join(marker).exists());
+
+            if !has_project_marker {
+                continue;
+            }
+
+            if let Some(ref path) = buffer_path {
+                let buffer_language = detect_language_from_path_or_name(Some(path), "");
+                if buffer_language == Some(*language) {
+                    self.try_send_did_open_for_buffer_idx(buffer_idx);
+                } else if let Err(error) = self
+                    .lsp_client
+                    .ensure_started_for_language(&self.root, *language)
+                {
+                    self.status_message =
+                        format!("{} LSP 启动失败: {error}", language.display_name());
+                    continue;
+                }
+            } else if let Err(error) = self
+                .lsp_client
+                .ensure_started_for_language(&self.root, *language)
+            {
+                self.status_message = format!("{} LSP 启动失败: {error}", language.display_name());
+                continue;
+            }
+
+            if *language == lsp::LspLanguage::Rust {
+                self.rust_analyzer_status = "rust-analyzer: 自动激活中".to_string();
+            }
         }
-
-        if self.lsp_client.is_language_running(lsp::LspLanguage::Rust) {
-            return;
-        }
-
-        self.try_send_did_open_for_buffer_idx(buffer_idx);
-        self.rust_analyzer_status = "rust-analyzer: 自动激活中".to_string();
     }
 
     /// 将 LSP 补全候选写回目标缓冲区。

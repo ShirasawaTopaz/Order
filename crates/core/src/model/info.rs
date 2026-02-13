@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use super::capabilities::ProviderCapabilitiesOverride;
+
 /// 模型连接信息。
 ///
 /// 该结构被 `rander` 与 `core::model::connection` 共同使用，
@@ -22,6 +24,13 @@ pub struct ModelInfo {
     pub model_name: String,
     /// 是否支持 tools。
     pub support_tools: bool,
+    /// provider 能力覆盖（可选）。
+    ///
+    /// 用途：
+    /// - 用户可在 `.order/model.json` 显式声明某些能力开关，避免“先失败再降级”；
+    /// - 与 `support_tools` 的区别：这里描述“provider 是否支持”，而不是“是否启用”。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ProviderCapabilitiesOverride>,
     /// Provider 名称，例如 `openai` / `claude` / `gemini`。
     pub provider_name: String,
     /// 模型最大上下文长度。
@@ -159,10 +168,13 @@ fn load_explicit_model_from_env() -> Option<ModelInfo> {
         first_non_empty_env(&["ORDER_MODEL_API_URL", "ORDER_API_URL"]).unwrap_or_default();
     let token = first_non_empty_env(&["ORDER_MODEL_TOKEN", "ORDER_API_KEY"]).unwrap_or_default();
 
-    let support_tools = first_non_empty_env(&["ORDER_MODEL_SUPPORT_TOOLS"])
-        .as_deref()
-        .map(parse_bool_text)
-        .unwrap_or(false);
+    // 对 Codex 默认启用 tools：
+    // - Codex 主打“带工具的编码工作流”，用户未显式配置时应开箱即用；
+    // - 若用户显式设置了 `ORDER_MODEL_SUPPORT_TOOLS`，则尊重用户选择。
+    let support_tools = match first_non_empty_env(&["ORDER_MODEL_SUPPORT_TOOLS"]) {
+        Some(value) => parse_bool_text(&value),
+        None => provider_name.eq_ignore_ascii_case("codex"),
+    };
     let model_max_context = first_non_empty_env(&["ORDER_MODEL_MAX_CONTEXT"])
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(0);
@@ -178,6 +190,7 @@ fn load_explicit_model_from_env() -> Option<ModelInfo> {
         token,
         model_name,
         support_tools,
+        capabilities: None,
         provider_name,
         model_max_context,
         model_max_output,
@@ -210,7 +223,9 @@ fn load_fallback_model_from_provider_env() -> Option<ModelInfo> {
             api_url,
             token,
             model_name,
-            support_tools: false,
+            // Codex 走环境变量兜底时默认开启 tools，提升“开箱即用”体验。
+            support_tools: true,
+            capabilities: None,
             provider_name: "codex".to_string(),
             model_max_context: 0,
             model_max_output: 0,
@@ -231,6 +246,7 @@ fn load_fallback_model_from_provider_env() -> Option<ModelInfo> {
             token,
             model_name,
             support_tools: false,
+            capabilities: None,
             provider_name: "openai".to_string(),
             model_max_context: 0,
             model_max_output: 0,
@@ -250,6 +266,7 @@ fn load_fallback_model_from_provider_env() -> Option<ModelInfo> {
             token,
             model_name,
             support_tools: false,
+            capabilities: None,
             provider_name: "claude".to_string(),
             model_max_context: 0,
             model_max_output: 0,
@@ -269,6 +286,7 @@ fn load_fallback_model_from_provider_env() -> Option<ModelInfo> {
             token,
             model_name,
             support_tools: false,
+            capabilities: None,
             provider_name: "gemini".to_string(),
             model_max_context: 0,
             model_max_output: 0,
@@ -417,7 +435,13 @@ fn parse_model_info_from_value(value: &Value) -> Option<ModelInfo> {
     let api_url =
         read_string_key(object, &["api_url", "apiUrl", "base_url", "baseUrl"]).unwrap_or_default();
     let token = read_string_key(object, &["token", "api_key", "apiKey", "key"]).unwrap_or_default();
-    let support_tools = read_bool_key(object, &["support_tools", "supportTools"]).unwrap_or(false);
+    let support_tools = if has_any_key(object, &["support_tools", "supportTools"]) {
+        // 显式声明时尊重配置值，避免自动开启工具导致意外副作用。
+        read_bool_key(object, &["support_tools", "supportTools"]).unwrap_or(false)
+    } else {
+        // 未显式声明时对 Codex 默认开启 tools，保持“编码助手”体验一致。
+        provider_name.eq_ignore_ascii_case("codex")
+    };
     let model_max_context =
         read_u32_key(object, &["model_max_context", "modelMaxContext"]).unwrap_or(0);
     let model_max_output =
@@ -430,11 +454,77 @@ fn parse_model_info_from_value(value: &Value) -> Option<ModelInfo> {
         token,
         model_name,
         support_tools,
+        capabilities: parse_capabilities_override_from_object(object),
         provider_name,
         model_max_context,
         model_max_output,
         model_max_tokens,
     }))
+}
+
+/// 解析模型配置中的 `capabilities` 覆盖字段。
+///
+/// 约定写法（示例）：
+/// ```json
+/// {
+///   "capabilities": {
+///     "tools": true,
+///     "system_preamble": true,
+///     "responses_api": false,
+///     "stream": false
+///   }
+/// }
+/// ```
+///
+/// 这样做的原因：
+/// - 配置覆盖是最高优先级的能力来源；
+/// - 在自定义网关/代理场景下，用户往往比“静态默认表”更清楚兼容性。
+fn parse_capabilities_override_from_object(
+    object: &Map<String, Value>,
+) -> Option<ProviderCapabilitiesOverride> {
+    let caps_value = object
+        .get("capabilities")
+        .or_else(|| object.get("provider_capabilities"))
+        .or_else(|| object.get("providerCapabilities"))?;
+    let caps_object = caps_value.as_object()?;
+
+    let override_caps = ProviderCapabilitiesOverride {
+        supports_tools: read_bool_key(caps_object, &["tools", "supports_tools", "support_tools"]),
+        supports_system_preamble: read_bool_key(
+            caps_object,
+            &[
+                "system_preamble",
+                "system_prompt",
+                "systemPrompt",
+                "supports_system_preamble",
+                "supportsSystemPreamble",
+            ],
+        ),
+        supports_responses_api: read_bool_key(
+            caps_object,
+            &[
+                "responses_api",
+                "responsesApi",
+                "responses",
+                "supports_responses_api",
+                "supportsResponsesApi",
+            ],
+        ),
+        supports_stream: read_bool_key(
+            caps_object,
+            &["stream", "streaming", "supports_stream", "supportsStream"],
+        ),
+    };
+
+    if override_caps.supports_tools.is_none()
+        && override_caps.supports_system_preamble.is_none()
+        && override_caps.supports_responses_api.is_none()
+        && override_caps.supports_stream.is_none()
+    {
+        None
+    } else {
+        Some(override_caps)
+    }
 }
 
 /// 对模型信息做轻量标准化。
@@ -489,6 +579,14 @@ fn read_bool_key(object: &Map<String, Value>, keys: &[&str]) -> Option<bool> {
     })
 }
 
+/// 判断对象是否包含任意一个指定字段。
+///
+/// 用途：区分“字段缺失”与“显式设置为 false”，
+/// 避免在缺失时误覆盖用户的显式选择。
+fn has_any_key(object: &Map<String, Value>, keys: &[&str]) -> bool {
+    keys.iter().any(|key| object.contains_key(*key))
+}
+
 /// 将文本解析为布尔值。
 fn parse_bool_text(text: &str) -> bool {
     matches!(
@@ -536,7 +634,9 @@ fn load_codex_cli_config() -> Option<ModelInfo> {
         api_url,
         token,
         model_name,
-        support_tools: false,
+        // Codex CLI 配置默认启用 tools，避免需要额外补充配置。
+        support_tools: true,
+        capabilities: None,
         provider_name: "codex".to_string(),
         model_max_context: 0,
         model_max_output: 0,

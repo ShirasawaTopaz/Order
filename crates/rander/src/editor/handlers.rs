@@ -1,5 +1,6 @@
 use std::{
     cmp::min,
+    collections::BTreeMap,
     path::{Path, PathBuf},
 };
 
@@ -9,7 +10,10 @@ use ratatui::layout::{Constraint, Direction, Layout};
 
 use super::{
     Editor, MAX_TREE_RATIO, MIN_TREE_RATIO,
-    types::{EditorBuffer, EditorMode, MainFocus, PaneFocus, SplitDirection, TabState},
+    types::{
+        CompletionDisplayItem, EditorBuffer, EditorMode, MainFocus, PaneFocus, SplitDirection,
+        TabState,
+    },
     utils::{contains_point, file_name_or, is_normal_command_prefix},
 };
 
@@ -26,6 +30,7 @@ impl Editor {
         match self.mode {
             EditorMode::Normal => self.handle_normal_key_event(key),
             EditorMode::Insert => self.handle_insert_key_event(key),
+            EditorMode::Visual => self.handle_visual_key_event(key),
             EditorMode::Terminal => self.handle_terminal_key_event(key),
             EditorMode::BufferPicker => self.handle_buffer_picker_key_event(key),
         }
@@ -51,6 +56,11 @@ impl Editor {
                 }
                 self.mode = EditorMode::Insert;
                 self.status_message = "INSERT".to_string();
+            }
+            KeyCode::Char('v') if self.normal_pending.is_empty() => {
+                // 与 Vim 习惯对齐：NORMAL 下按 v 进入 VISUAL，先只切换模式，后续可扩展选区。
+                self.mode = EditorMode::Visual;
+                self.status_message = "VISUAL".to_string();
             }
             KeyCode::Char('h') if self.normal_pending.is_empty() => {
                 if self.main_focus == MainFocus::Tree {
@@ -156,6 +166,98 @@ impl Editor {
         }
     }
 
+    /// 处理 VISUAL 模式按键。
+    ///
+    /// 当前未实现选区逻辑，因此只保留 Vim 的进入/退出与导航体验，
+    /// 避免在 VISUAL 中触发普通命令引发意外副作用。
+    pub(super) fn handle_visual_key_event(&mut self, key: KeyEvent) {
+        self.normalize_active_tab_focus();
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('v') => {
+                self.mode = EditorMode::Normal;
+                self.normal_pending.clear();
+                self.status_message = "NORMAL".to_string();
+            }
+            KeyCode::Char('h') => {
+                if self.main_focus == MainFocus::Tree {
+                    return;
+                }
+                self.active_buffer_mut().move_left();
+            }
+            KeyCode::Char('l') => {
+                if self.main_focus == MainFocus::Tree {
+                    self.open_selected_tree_entry();
+                    return;
+                }
+                self.active_buffer_mut().move_right();
+            }
+            KeyCode::Char('j') => {
+                if self.main_focus == MainFocus::Tree {
+                    self.tree_select_next();
+                    return;
+                }
+                self.active_buffer_mut().move_down();
+            }
+            KeyCode::Char('k') => {
+                if self.main_focus == MainFocus::Tree {
+                    self.tree_select_prev();
+                    return;
+                }
+                self.active_buffer_mut().move_up();
+            }
+            KeyCode::Left => {
+                if self.main_focus == MainFocus::Tree {
+                    return;
+                }
+                self.active_buffer_mut().move_left();
+            }
+            KeyCode::Right => {
+                if self.main_focus == MainFocus::Tree {
+                    self.main_focus = MainFocus::Editor;
+                    self.status_message = "焦点切换到编辑区".to_string();
+                    return;
+                }
+                self.active_buffer_mut().move_right();
+            }
+            KeyCode::Down => {
+                if self.main_focus == MainFocus::Tree {
+                    self.tree_select_next();
+                    return;
+                }
+                self.active_buffer_mut().move_down();
+            }
+            KeyCode::Up => {
+                if self.main_focus == MainFocus::Tree {
+                    self.tree_select_prev();
+                    return;
+                }
+                self.active_buffer_mut().move_up();
+            }
+            KeyCode::Enter => {
+                if self.main_focus == MainFocus::Tree {
+                    self.open_selected_tree_entry();
+                }
+            }
+            KeyCode::Char(ch) if self.main_focus == MainFocus::Tree => {
+                match ch {
+                    'j' => self.tree_select_next(),
+                    'k' => self.tree_select_prev(),
+                    'l' => self.open_selected_tree_entry(),
+                    'h' => {
+                        if self.tree_entries.is_empty() {
+                            return;
+                        }
+                        let path = self.tree_entries[self.tree_selected].path.clone();
+                        self.toggle_expand_dir(path);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
     // 处理 INSERT 模式按键。
     pub(super) fn handle_insert_key_event(&mut self, key: KeyEvent) {
         match key.code {
@@ -163,7 +265,8 @@ impl Editor {
                 self.mode = EditorMode::Normal;
                 self.insert_j_pending = false;
                 self.status_message = "NORMAL".to_string();
-                self.refresh_completion();
+                self.completion_items.clear();
+                self.completion_selected = 0;
             }
             KeyCode::Char('k') if self.insert_j_pending => {
                 // `jk` 作为 INSERT 模式退出快捷键：
@@ -173,7 +276,8 @@ impl Editor {
                 self.mode = EditorMode::Normal;
                 self.insert_j_pending = false;
                 self.status_message = "NORMAL".to_string();
-                self.refresh_completion();
+                self.completion_items.clear();
+                self.completion_selected = 0;
             }
             KeyCode::Char(ch) => {
                 self.insert_j_pending = ch == 'j';
@@ -187,8 +291,13 @@ impl Editor {
             }
             KeyCode::Enter => {
                 self.insert_j_pending = false;
-                self.active_buffer_mut().insert_newline();
-                self.refresh_completion();
+                if !self.completion_items.is_empty() {
+                    self.accept_completion();
+                    self.refresh_completion();
+                } else {
+                    self.active_buffer_mut().insert_newline();
+                    self.refresh_completion();
+                }
             }
             KeyCode::Tab => {
                 if !self.completion_items.is_empty() {
@@ -201,6 +310,11 @@ impl Editor {
                     self.refresh_completion();
                 }
             }
+            KeyCode::BackTab => {
+                if !self.completion_items.is_empty() {
+                    self.select_prev_completion();
+                }
+            }
             KeyCode::Left => {
                 self.active_buffer_mut().move_left();
                 self.refresh_completion();
@@ -210,12 +324,20 @@ impl Editor {
                 self.refresh_completion();
             }
             KeyCode::Up => {
-                self.active_buffer_mut().move_up();
-                self.refresh_completion();
+                if !self.completion_items.is_empty() {
+                    self.select_prev_completion();
+                } else {
+                    self.active_buffer_mut().move_up();
+                    self.refresh_completion();
+                }
             }
             KeyCode::Down => {
-                self.active_buffer_mut().move_down();
-                self.refresh_completion();
+                if !self.completion_items.is_empty() {
+                    self.select_next_completion();
+                } else {
+                    self.active_buffer_mut().move_down();
+                    self.refresh_completion();
+                }
             }
             _ => {
                 self.insert_j_pending = false;
@@ -542,16 +664,11 @@ impl Editor {
                 true
             }
             "ci" => {
-                self.completion_selected = self.completion_selected.saturating_sub(1);
+                self.select_prev_completion();
                 true
             }
             "cu" => {
-                if !self.completion_items.is_empty() {
-                    self.completion_selected = min(
-                        self.completion_selected + 1,
-                        self.completion_items.len().saturating_sub(1),
-                    );
-                }
+                self.select_next_completion();
                 true
             }
             "w" => {
@@ -674,15 +791,43 @@ impl Editor {
 
     // 刷新自动补全候选列表。
     pub(super) fn refresh_completion(&mut self) {
-        // 先使用最近一次 LSP 返回结果更新 UI，再异步请求下一轮补全。
+        // 先消费上一次 LSP 返回结果刷新 UI，再异步请求下一轮补全。
         self.refresh_completion_from_lsp_cache();
         self.request_completion_for_active_buffer();
     }
 
+    /// 切换到上一个补全候选。
+    ///
+    /// 这里使用循环游标，原因是连续按键时用户通常希望在候选列表中环形浏览，
+    /// 而不是在边界处停住。
+    fn select_prev_completion(&mut self) {
+        if self.completion_items.is_empty() {
+            self.completion_selected = 0;
+            return;
+        }
+
+        if self.completion_selected == 0 {
+            self.completion_selected = self.completion_items.len().saturating_sub(1);
+        } else {
+            self.completion_selected = self.completion_selected.saturating_sub(1);
+        }
+    }
+
+    /// 切换到下一个补全候选。
+    ///
+    /// 和 `select_prev_completion` 对称，统一使用循环游标，避免边界分支带来的体验割裂。
+    fn select_next_completion(&mut self) {
+        if self.completion_items.is_empty() {
+            self.completion_selected = 0;
+            return;
+        }
+        self.completion_selected = (self.completion_selected + 1) % self.completion_items.len();
+    }
+
     /// 基于 buffer 缓存中的 LSP 补全项刷新展示列表。
     ///
-    /// 这里按“当前前缀 + 插入文本”做一次轻过滤，
-    /// 是为了避免服务端返回候选过多时干扰编辑体验。
+    /// 这里按“当前前缀 + insert_text/label”做一次轻过滤，
+    /// 再按 insert_text 去重，避免服务端返回大量重复候选导致补全 popover 噪声过高。
     pub(super) fn refresh_completion_from_lsp_cache(&mut self) {
         let Some((_, _, prefix)) = self.active_buffer().word_prefix() else {
             self.completion_items.clear();
@@ -695,32 +840,42 @@ impl Editor {
             return;
         }
 
-        let mut candidates = Vec::new();
+        let mut candidates: BTreeMap<String, CompletionDisplayItem> = BTreeMap::new();
         for item in &self.active_buffer().lsp_completion_items {
-            let insert_text = item.insert_text.as_deref().unwrap_or(&item.label);
-            if insert_text.starts_with(&prefix) && insert_text != prefix {
-                candidates.push(insert_text.to_string());
+            let insert_text = item
+                .insert_text
+                .as_deref()
+                .unwrap_or(item.label.as_str())
+                .to_string();
+            let label = item.label.clone();
+            let matched = (insert_text.starts_with(&prefix) && insert_text != prefix)
+                || (label.starts_with(&prefix) && label != prefix);
+            if !matched {
                 continue;
             }
 
-            // 当服务端返回 label 与 insertText 不一致时，
-            // 回退到 label 过滤，确保候选不会被意外漏掉。
-            if item.label.starts_with(&prefix) && item.label != prefix {
-                candidates.push(item.label.clone());
-            }
+            let display = CompletionDisplayItem {
+                label,
+                insert_text: insert_text.clone(),
+                detail: item.detail.clone(),
+            };
+            candidates
+                .entry(insert_text)
+                .and_modify(|existing| {
+                    // 优先保留带 detail 的候选，便于 popover 展示更多上下文。
+                    if existing.detail.is_none() && display.detail.is_some() {
+                        existing.detail = display.detail.clone();
+                    }
+                })
+                .or_insert(display);
         }
 
-        candidates.sort();
-        candidates.dedup();
-        self.completion_items = candidates.into_iter().take(20).collect();
+        self.completion_items = candidates.into_values().take(20).collect();
         if self.completion_selected >= self.completion_items.len() {
             self.completion_selected = 0;
         }
     }
 
-    /// 向当前活动缓冲区发起一次 LSP 补全请求。
-    ///
-    /// 采用“异步请求 + 下一帧消费”策略，避免在按键路径中阻塞输入手感。
     fn request_completion_for_active_buffer(&mut self) {
         let buffer_idx = self.tabs[self.active_tab].buffer_index;
         let Some((path, cursor_row, cursor_col)) =
@@ -747,27 +902,22 @@ impl Editor {
             return;
         }
 
-        let selected_label = self.completion_items[self.completion_selected].clone();
-        let choice = self
-            .active_buffer()
-            .lsp_completion_items
-            .iter()
-            .find_map(|item| {
-                let insert_text = item.insert_text.as_deref().unwrap_or(&item.label);
-                if insert_text == selected_label || item.label == selected_label {
-                    Some(insert_text.to_string())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(selected_label);
+        let selected = self.completion_items[self.completion_selected].clone();
+        let choice = if selected.insert_text.is_empty() {
+            selected.label
+        } else {
+            selected.insert_text
+        };
 
         if let Some((start, end, _)) = self.active_buffer().word_prefix() {
             self.active_buffer_mut().replace_prefix(start, end, &choice);
         }
+
+        // 接受补全后立即清空候选，避免旧数据在下一次输入前残留。
+        self.completion_items.clear();
+        self.completion_selected = 0;
     }
 
-    // 新建标签页。
     pub(super) fn new_tab(&mut self) {
         let name = format!("untitled-{}", self.buffers.len() + 1);
         self.buffers.push(EditorBuffer::new_empty(name));

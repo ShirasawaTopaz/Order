@@ -11,6 +11,9 @@ pub const AVAILABLE_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show help information"),
     ("/exit", "Exit the application"),
     ("/cancel", "Cancel latest operation"),
+    ("/approve", "Approve pending writes by trace_id"),
+    ("/reject", "Reject pending writes by trace_id"),
+    ("/rollback", "Rollback snapshot by trace_id (or latest)"),
     (
         "/history",
         "Open history browser; support /history N, /history clear",
@@ -338,6 +341,7 @@ impl InputState {
 pub struct InputWidget<'a> {
     state: &'a InputState,
     context_remaining: Option<u32>,
+    status_message: Option<String>,
 }
 
 impl<'a> InputWidget<'a> {
@@ -346,12 +350,19 @@ impl<'a> InputWidget<'a> {
         Self {
             state,
             context_remaining: None,
+            status_message: None,
         }
     }
 
     /// 设置剩余上下文百分比显示。
     pub fn set_context_remaining(&mut self, percentage: u32) -> &mut Self {
         self.context_remaining = Some(percentage);
+        self
+    }
+
+    /// 设置状态栏消息（显示在输入框标题左侧）。
+    pub fn set_status_message(&mut self, message: impl Into<String>) -> &mut Self {
+        self.status_message = Some(message.into());
         self
     }
 
@@ -389,10 +400,25 @@ impl<'a> Widget for InputWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let mut input_block = Block::bordered().border_style(Style::default().fg(Color::DarkGray));
 
+        if let Some(status) = self.status_message.as_deref() {
+            // 状态栏是“快速定位问题”的入口，因此使用醒目颜色，但保持文案尽量简短。
+            input_block = input_block.title(
+                Line::from(vec![Span::styled(
+                    format!(" {status} "),
+                    Style::default().fg(Color::Red).bold(),
+                )])
+                .left_aligned(),
+            );
+        }
+
         if let Some(remaining) = self.context_remaining {
-            input_block = input_block
-                .title(format!(" Context: {}% ", remaining))
-                .title_alignment(ratatui::layout::Alignment::Right);
+            input_block = input_block.title(
+                Line::from(vec![Span::styled(
+                    format!(" Context: {}% ", remaining),
+                    Style::default().fg(Color::Yellow).bold(),
+                )])
+                .right_aligned(),
+            );
         }
 
         let mut input_spans = vec![Span::styled(

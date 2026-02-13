@@ -240,6 +240,7 @@ impl Editor {
         let mode_text = match self.mode {
             EditorMode::Normal => "NORMAL",
             EditorMode::Insert => "INSERT",
+            EditorMode::Visual => "VISUAL",
             EditorMode::Terminal => "TERMINAL",
             EditorMode::BufferPicker => "BUFFER",
         };
@@ -852,6 +853,7 @@ impl Editor {
         let mode = match self.mode {
             EditorMode::Normal => "NORMAL",
             EditorMode::Insert => "INSERT",
+            EditorMode::Visual => "VISUAL",
             EditorMode::Terminal => "TERMINAL",
             EditorMode::BufferPicker => "BUFFER",
         };

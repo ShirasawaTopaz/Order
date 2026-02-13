@@ -197,6 +197,23 @@ impl LspLanguage {
             ],
         }
     }
+
+    /// 返回该语言的项目标识文件列表。
+    ///
+    /// 这些文件用于判断项目根目录是否属于该语言项目，
+    /// 从而实现 LSP 的自动激活。
+    pub fn project_markers(self) -> &'static [&'static str] {
+        match self {
+            Self::Rust => &["Cargo.toml"],
+            Self::Python => &["pyproject.toml", "setup.py", "requirements.txt", "Pipfile"],
+            Self::TypeScript | Self::JavaScript => &["package.json", "tsconfig.json"],
+            Self::Html | Self::Css => &[],
+            Self::Vue => &["package.json"],
+            Self::Java => &["pom.xml", "build.gradle", "build.gradle.kts"],
+            Self::Go => &["go.mod"],
+            Self::C | Self::Cpp => &["compile_commands.json", "CMakeLists.txt", "Makefile"],
+        }
+    }
 }
 
 /// 根据路径识别语言。

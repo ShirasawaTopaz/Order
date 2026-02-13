@@ -1,6 +1,11 @@
 use rig::{completion::ToolDefinition, tool::Tool};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use tokio::{fs::File, io::AsyncReadExt};
+
+use crate::observability::{
+    AgentEvent, current_trace_id, log_event_best_effort, ts, workspace_root_best_effort,
+};
 
 use super::workspace::{
     MAX_READ_BYTES, ensure_no_symlink_in_existing_path, resolve_workspace_relative_path,
@@ -65,43 +70,76 @@ impl Tool for ReadTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, ReadToolError> {
-        // 通过“工作区内相对路径”约束模型可访问的文件范围，避免越权读取。
-        let root = workspace_root().map_err(ReadToolError::Other)?;
-        let resolved =
-            resolve_workspace_relative_path(&root, &args.path).map_err(ReadToolError::Other)?;
-        ensure_no_symlink_in_existing_path(&root, &resolved).map_err(ReadToolError::Other)?;
-
-        let metadata = tokio::fs::metadata(&resolved)
-            .await
-            .map_err(ReadToolError::IoError)?;
-        if !metadata.is_file() {
-            return Err(ReadToolError::Other(format!(
-                "path 不是文件: {}",
-                resolved.display()
-            )));
-        }
-        if metadata.len() > MAX_READ_BYTES {
-            return Err(ReadToolError::Other(format!(
-                "文件过大（{} bytes），已拒绝读取；请缩小文件或提高上限",
-                metadata.len()
-            )));
+        let workspace_root_for_log = workspace_root_best_effort();
+        let trace_id = current_trace_id();
+        let started_at = Instant::now();
+        if let Some(ref trace_id) = trace_id {
+            log_event_best_effort(
+                &workspace_root_for_log,
+                AgentEvent::ToolCallStart {
+                    ts: ts(),
+                    trace_id: trace_id.clone(),
+                    tool: Self::NAME.to_string(),
+                },
+            );
         }
 
-        // 使用异步读取避免阻塞运行时线程，并且只接受 UTF-8 文本。
-        let mut file = File::open(&resolved)
-            .await
-            .map_err(ReadToolError::IoError)?;
-        let mut content = String::new();
-        if let Err(error) = file.read_to_string(&mut content).await {
-            if error.kind() == std::io::ErrorKind::InvalidData {
+        let result: Result<String, ReadToolError> = (async {
+            // 通过“工作区内相对路径”约束模型可访问的文件范围，避免越权读取。
+            let root = workspace_root().map_err(ReadToolError::Other)?;
+            let resolved =
+                resolve_workspace_relative_path(&root, &args.path).map_err(ReadToolError::Other)?;
+            ensure_no_symlink_in_existing_path(&root, &resolved).map_err(ReadToolError::Other)?;
+
+            let metadata = tokio::fs::metadata(&resolved)
+                .await
+                .map_err(ReadToolError::IoError)?;
+            if !metadata.is_file() {
                 return Err(ReadToolError::Other(format!(
-                    "文件不是 UTF-8 文本，无法读取: {}",
+                    "path 不是文件: {}",
                     resolved.display()
                 )));
             }
-            return Err(ReadToolError::IoError(error));
+            if metadata.len() > MAX_READ_BYTES {
+                return Err(ReadToolError::Other(format!(
+                    "文件过大（{} bytes），已拒绝读取；请缩小文件或提高上限",
+                    metadata.len()
+                )));
+            }
+
+            // 使用异步读取避免阻塞运行时线程，并且只接受 UTF-8 文本。
+            let mut file = File::open(&resolved)
+                .await
+                .map_err(ReadToolError::IoError)?;
+            let mut content = String::new();
+            if let Err(error) = file.read_to_string(&mut content).await {
+                if error.kind() == std::io::ErrorKind::InvalidData {
+                    return Err(ReadToolError::Other(format!(
+                        "文件不是 UTF-8 文本，无法读取: {}",
+                        resolved.display()
+                    )));
+                }
+                return Err(ReadToolError::IoError(error));
+            }
+
+            Ok(content)
+        })
+        .await;
+
+        if let Some(ref trace_id) = trace_id {
+            log_event_best_effort(
+                &workspace_root_for_log,
+                AgentEvent::ToolCallEnd {
+                    ts: ts(),
+                    trace_id: trace_id.clone(),
+                    tool: Self::NAME.to_string(),
+                    ok: result.is_ok(),
+                    duration_ms: started_at.elapsed().as_millis(),
+                    error: result.as_ref().err().map(|e| e.to_string()),
+                },
+            );
         }
 
-        Ok(content)
+        result
     }
 }

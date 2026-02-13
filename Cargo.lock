@@ -243,6 +243,8 @@ name = "core"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "futures",
  "rig-core",
  "serde",
  "serde_json",

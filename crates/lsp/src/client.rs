@@ -308,7 +308,8 @@ impl LspClient {
             return Ok(());
         }
 
-        // 閲囩敤鈥滀粠鍚庡埌鍓嶁€濈殑缂栬緫椤哄簭锛岄伩鍏嶅尯闂存紓绉汇€?        content_changes.reverse();
+        // 采用“从后到前”的编辑顺序，避免前序变更影响后序 range 偏移。
+        content_changes.reverse();
 
         let did_change = serde_json::json!({
             "jsonrpc": "2.0",

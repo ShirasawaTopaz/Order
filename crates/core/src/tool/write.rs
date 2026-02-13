@@ -1,11 +1,15 @@
 use rig::{completion::ToolDefinition, tool::Tool};
 use serde::{Deserialize, Serialize};
-use tokio::{fs::File, io::AsyncWriteExt};
+use std::time::Instant;
 
-use super::workspace::{
-    MAX_WRITE_BYTES, ensure_no_symlink_in_existing_path, resolve_workspace_relative_path,
-    workspace_root,
+use crate::{
+    observability::{
+        AgentEvent, current_trace_id, log_event_best_effort, ts, workspace_root_best_effort,
+    },
+    safety::ExecutionGuard,
 };
+
+use super::workspace::MAX_WRITE_BYTES;
 
 #[derive(Clone, Deserialize)]
 pub struct WriteToolArgs {
@@ -50,7 +54,7 @@ impl Tool for WriteTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "写入工作区内文件内容（仅允许相对路径，默认将 CRLF 规范为 LF）"
+            description: "写入工作区内文件内容（高风险：默认不直接落盘，会生成预览并要求用户二次确认；默认将 CRLF 规范为 LF）"
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -74,50 +78,93 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        // 通过“工作区内相对路径”约束模型可写入的范围，避免越权写文件。
-        let root = workspace_root().map_err(WriteToolError::Other)?;
-        let path =
-            resolve_workspace_relative_path(&root, &args.path).map_err(WriteToolError::Other)?;
-        ensure_no_symlink_in_existing_path(&root, &path).map_err(WriteToolError::Other)?;
+        let workspace_root_for_log = workspace_root_best_effort();
+        let trace_id = current_trace_id();
+        let started_at = Instant::now();
+        if let Some(ref trace_id) = trace_id {
+            log_event_best_effort(
+                &workspace_root_for_log,
+                AgentEvent::ToolCallStart {
+                    ts: ts(),
+                    trace_id: trace_id.clone(),
+                    tool: Self::NAME.to_string(),
+                },
+            );
+        }
 
         let append = args.append.unwrap_or(false);
 
         // 统一将 CRLF 规范为 LF，减少跨平台协作时的 diff 噪音。
         let content = args.content.replace("\r\n", "\n");
         if content.as_bytes().len() > MAX_WRITE_BYTES {
-            return Err(WriteToolError::Other(format!(
+            let result: Result<String, WriteToolError> = Err(WriteToolError::Other(format!(
                 "写入内容过大（{} bytes），已拒绝写入；请拆分或提高上限",
                 content.as_bytes().len()
             )));
+
+            if let Some(ref trace_id) = trace_id {
+                log_event_best_effort(
+                    &workspace_root_for_log,
+                    AgentEvent::ToolCallEnd {
+                        ts: ts(),
+                        trace_id: trace_id.clone(),
+                        tool: Self::NAME.to_string(),
+                        ok: false,
+                        duration_ms: started_at.elapsed().as_millis(),
+                        error: result.as_ref().err().map(|e| e.to_string()),
+                    },
+                );
+            }
+
+            return result;
         }
 
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(WriteToolError::IoError)?;
+        let result: Result<String, WriteToolError> = (|| {
+            let trace_id = trace_id.as_ref().ok_or_else(|| {
+                WriteToolError::Other("缺少 trace_id：无法进入安全写入确认流程".to_string())
+            })?;
+
+            let guard = ExecutionGuard::default();
+            let summary = guard
+                .stage_write(trace_id, &args.path, &content, append)
+                .map_err(|error| WriteToolError::Other(error.to_string()))?;
+
+            Err(WriteToolError::Other(format!(
+                "高风险写入已拦截（未落盘）。\n\
+trace_id: {trace_id}\n\
+path: {}\n\
+append: {}\n\
+diff: existed={} old_lines={} new_lines={} +{} -{}\n\
+\n\
+请在 TUI 中执行：\n\
+- `/approve {trace_id}` 确认写入（将自动创建快照，必要时可回滚）\n\
+- `/reject {trace_id}` 取消本次写入\n\
+\n\
+确认写入后，如需回滚：`/rollback {trace_id}`",
+                summary.path,
+                summary.append,
+                summary.diff.existed,
+                summary.diff.old_lines,
+                summary.diff.new_lines,
+                summary.diff.added_lines,
+                summary.diff.removed_lines
+            )))
+        })();
+
+        if let Some(ref trace_id) = trace_id {
+            log_event_best_effort(
+                &workspace_root_for_log,
+                AgentEvent::ToolCallEnd {
+                    ts: ts(),
+                    trace_id: trace_id.clone(),
+                    tool: Self::NAME.to_string(),
+                    ok: result.is_ok(),
+                    duration_ms: started_at.elapsed().as_millis(),
+                    error: result.as_ref().err().map(|e| e.to_string()),
+                },
+            );
         }
 
-        if append {
-            let mut file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .await
-                .map_err(WriteToolError::IoError)?;
-            file.write_all(content.as_bytes())
-                .await
-                .map_err(WriteToolError::IoError)?;
-            file.flush().await.map_err(WriteToolError::IoError)?;
-        } else {
-            let mut file = File::create(&path).await.map_err(WriteToolError::IoError)?;
-            file.write_all(content.as_bytes())
-                .await
-                .map_err(WriteToolError::IoError)?;
-            file.flush().await.map_err(WriteToolError::IoError)?;
-        }
-
-        Ok(format!("write success: {}", path.display()))
+        result
     }
 }

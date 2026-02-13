@@ -1,16 +1,22 @@
 use crate::{
     editor::Editor,
     focus_status::{CURRENT_FOCUS, FocusStatus},
+    history::{ContextManager, ContextMessage, ContextModelLimits, ContextRole},
     widget::input_widget::{InputState, InputWidget},
 };
 use anyhow::{Context, anyhow};
-use chrono::Local;
+use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use core::{
     commands::{EXIT, get_exit},
     model::{
-        connection::{Connection, Provider},
+        connection::{Connection, ModelStreamEvent, Provider},
         info::{get_current_model_info, get_current_model_info_from_config},
     },
+    observability::{
+        AgentEvent, log_event_best_effort, new_trace_id, ts, workspace_root_best_effort,
+    },
+    safety::ExecutionGuard,
+    validation::ValidationPipeline,
 };
 use crossterm::{
     event::{
@@ -24,8 +30,13 @@ use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -125,6 +136,37 @@ struct HistoryBrowserState {
     selected: usize,
 }
 
+/// 最近一次失败的摘要信息（用于状态栏展示）。
+#[derive(Debug, Clone)]
+struct FailureSummary {
+    trace_id: String,
+    reason: String,
+}
+
+/// 后台补全线程向主线程回传的事件。
+///
+/// 设计原因：
+/// - TUI 主循环必须保持可响应输入（例如 `/cancel`、滚动、快捷键）；
+/// - 模型请求和重试在后台线程执行，主线程只消费事件并刷新界面。
+#[derive(Debug)]
+enum CompletionWorkerEvent {
+    Stream(ModelStreamEvent),
+    Completed(Result<(), String>),
+}
+
+/// 当前正在进行中的模型请求状态。
+#[derive(Debug)]
+struct ActiveCompletion {
+    trace_id: String,
+    receiver: Receiver<CompletionWorkerEvent>,
+    cancel_flag: Arc<AtomicBool>,
+    user_message_index: usize,
+    assistant_message_index: usize,
+    received_delta: bool,
+    last_tool_progress: Option<String>,
+    started_at: Instant,
+}
+
 pub struct OrderTui<'a> {
     /// 全局退出标记。
     exit: &'a AtomicBool,
@@ -134,6 +176,10 @@ pub struct OrderTui<'a> {
     last_tick: Instant,
     /// 预留上下文剩余量。
     context_remaining: u32,
+    /// 分层上下文管理器。
+    ///
+    /// 负责短期上下文裁剪、中期摘要生成与长期记忆持久化。
+    context_manager: ContextManager,
     /// 回车后待处理的输入文本。
     pending_command: Option<String>,
     /// 与大模型通信的连接。
@@ -157,6 +203,10 @@ pub struct OrderTui<'a> {
     ///
     /// 0 表示显示最新消息（底部），大于 0 表示向上滚动的行数。
     conversation_scroll: usize,
+    /// 最近一次失败摘要（用于状态栏快速定位）。
+    last_failure: Option<FailureSummary>,
+    /// 当前是否存在正在执行的流式请求。
+    active_completion: Option<ActiveCompletion>,
 }
 
 impl Default for OrderTui<'_> {
@@ -167,12 +217,15 @@ impl Default for OrderTui<'_> {
             input_state: InputState::default(),
             last_tick: Instant::now(),
             context_remaining: 100,
+            context_manager: ContextManager::new(),
             pending_command: None,
             connection: None,
             messages: Vec::new(),
             session_timestamp: now.format("%Y-%-m-%-d %H:%M:%S").to_string(),
             history_browser: None,
             conversation_scroll: 0,
+            last_failure: None,
+            active_completion: None,
         }
     }
 }
@@ -197,8 +250,10 @@ impl OrderTui<'_> {
         // 若启动探测发生阻塞，需要重置闪烁时钟，避免首帧就快速闪烁。
         self.last_tick = Instant::now();
 
-        let tick_rate = Duration::from_millis(500);
+        // 降低 tick 间隔，保证流式增量渲染时界面刷新更及时。
+        let tick_rate = Duration::from_millis(100);
         while !get_exit().load(Ordering::Relaxed) {
+            self.poll_active_completion_events();
             terminal.draw(|frame| self.draw(frame))?;
 
             let timeout = tick_rate
@@ -210,6 +265,7 @@ impl OrderTui<'_> {
                     Event::Key(key) => {
                         self.handle_key_event(&key);
                         self.process_pending_command(terminal)?;
+                        self.poll_active_completion_events();
                         self.input_state.set_cursor_visible(true);
                         self.last_tick = Instant::now();
                     }
@@ -431,7 +487,11 @@ impl OrderTui<'_> {
                 }
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.exit.store(true, Ordering::Relaxed);
+                if self.active_completion.is_some() {
+                    self.cancel_active_completion("已发送取消信号（Ctrl+C）".to_string());
+                } else {
+                    self.exit.store(true, Ordering::Relaxed);
+                }
             }
             KeyCode::Char(to_insert) if CURRENT_FOCUS == FocusStatus::InputWidget => {
                 self.input_state.insert_char(to_insert);
@@ -560,32 +620,33 @@ impl OrderTui<'_> {
 
     /// 处理普通输入（非 `/` 命令）。
     fn process_plain_input(&mut self, input: String) {
-        // 用户输入以对话形式展示在右侧。
-        self.push_chat_message(ChatRole::User, input.clone(), true);
+        // 同一时刻只允许一个模型请求，避免多路流式结果交错污染渲染与上下文状态。
+        if self.active_completion.is_some() {
+            self.push_chat_message(
+                ChatRole::Error,
+                "当前已有进行中的请求，请先使用 /cancel 或 Ctrl+C 取消".to_string(),
+                false,
+            );
+            return;
+        }
 
         // 发送新消息时重置滚动，显示最新内容。
         self.conversation_scroll = 0;
 
-        // 发送结果以对话形式展示：
-        // - 成功：LLM 回复显示在左侧；
-        // - 失败：错误显示在左侧；
-        // 并且都不会导致程序退出。
-        match self.send_prompt_to_llm(input) {
-            Ok(response) => self.push_chat_message(ChatRole::Llm, response, true),
-            Err(error) => {
-                let error_msg = error.to_string();
-                if error_msg.contains("API Key 未配置") {
-                    self.push_chat_message(
-                        ChatRole::Error,
-                        format!(
-                            "{}\n\n配置方式：\n1. 设置环境变量 CODEX_API_KEY 或 OPENAI_API_KEY\n2. 或在 .order/model.json 中设置 token 字段",
-                            error_msg
-                        ),
-                        true,
-                    );
-                } else {
-                    self.push_chat_message(ChatRole::Error, format!("发送失败：{error}"), true);
-                }
+        // 改为后台线程流式执行，主循环继续可响应输入和中断。
+        if let Err(error) = self.start_streaming_completion(input) {
+            let error_msg = error.to_string();
+            if error_msg.contains("API Key 未配置") {
+                self.push_chat_message(
+                    ChatRole::Error,
+                    format!(
+                        "{}\n\n配置方式：\n1. 设置环境变量 CODEX_API_KEY 或 OPENAI_API_KEY\n2. 或在 .order/model.json 中设置 token 字段",
+                        error_msg
+                    ),
+                    false,
+                );
+            } else {
+                self.push_chat_message(ChatRole::Error, format!("发送失败：{error}"), false);
             }
         }
     }
@@ -601,9 +662,191 @@ impl OrderTui<'_> {
             return Ok(());
         };
 
+        // 请求进行中时限制高风险命令，避免状态交错导致界面与上下文不一致。
+        if self.active_completion.is_some() && !matches!(command, "/cancel" | "/status" | "/exit") {
+            self.push_chat_message(
+                ChatRole::Error,
+                "当前请求进行中，仅支持 /cancel、/status、/exit".to_string(),
+                false,
+            );
+            return Ok(());
+        }
+
         match command {
             "/editor" => self.launch_editor(terminal)?,
             "/exit" => self.exit.store(true, Ordering::Relaxed),
+            "/cancel" => {
+                if self.active_completion.is_some() {
+                    self.cancel_active_completion("已发送取消信号（/cancel）".to_string());
+                } else {
+                    self.push_chat_message(
+                        ChatRole::Llm,
+                        "当前没有可取消的进行中请求".to_string(),
+                        false,
+                    );
+                }
+            }
+            "/approve" => {
+                let Some(trace_id) = segments.next() else {
+                    self.push_chat_message(
+                        ChatRole::Error,
+                        "用法：/approve <trace_id>".to_string(),
+                        false,
+                    );
+                    return Ok(());
+                };
+
+                let guard = ExecutionGuard::default();
+                match guard.apply_pending_writes(trace_id) {
+                    Ok(result) => {
+                        self.push_chat_message(
+                            ChatRole::Llm,
+                            format!(
+                                "已确认写入（trace_id={}），影响文件数={}：\n{}",
+                                result.trace_id,
+                                result.files.len(),
+                                result
+                                    .files
+                                    .iter()
+                                    .map(|path| format!("- {path}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            ),
+                            false,
+                        );
+
+                        // 确认写入后自动跑最小验证闭环，并把结果归档到 `.order/reports/<trace_id>/validation.json`。
+                        let pipeline = ValidationPipeline::default();
+                        match pipeline.run(trace_id, &result.files) {
+                            Ok(report) => {
+                                if report.ok {
+                                    self.push_chat_message(
+                                        ChatRole::Llm,
+                                        format!(
+                                            "自动验证通过（耗时={}ms）。报告已写入 `.order/reports/{}/validation.json`",
+                                            report.duration_ms, report.trace_id
+                                        ),
+                                        false,
+                                    );
+                                } else {
+                                    self.push_chat_message(
+                                        ChatRole::Error,
+                                        format!(
+                                            "自动验证失败（耗时={}ms）。失败命令：{}\n报告已写入 `.order/reports/{}/validation.json`\n{}",
+                                            report.duration_ms,
+                                            report.failed_command.clone().unwrap_or_else(|| "<unknown>".to_string()),
+                                            report.trace_id,
+                                            report.suggestion.clone().unwrap_or_default()
+                                        ),
+                                        false,
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                self.push_chat_message(
+                                    ChatRole::Error,
+                                    format!("自动验证执行失败：{error}"),
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.push_chat_message(
+                            ChatRole::Error,
+                            format!("确认写入失败：{error}"),
+                            false,
+                        );
+                    }
+                }
+            }
+            "/reject" => {
+                let Some(trace_id) = segments.next() else {
+                    self.push_chat_message(
+                        ChatRole::Error,
+                        "用法：/reject <trace_id>".to_string(),
+                        false,
+                    );
+                    return Ok(());
+                };
+
+                let guard = ExecutionGuard::default();
+                match guard.reject_pending_writes(trace_id) {
+                    Ok(()) => self.push_chat_message(
+                        ChatRole::Llm,
+                        format!("已取消待确认写入：trace_id={trace_id}"),
+                        false,
+                    ),
+                    Err(error) => self.push_chat_message(
+                        ChatRole::Error,
+                        format!("取消待确认写入失败：{error}"),
+                        false,
+                    ),
+                }
+            }
+            "/rollback" => {
+                let guard = ExecutionGuard::default();
+                match segments.next() {
+                    Some(trace_id) => match guard.rollback(trace_id) {
+                        Ok(result) => self.push_chat_message(
+                            ChatRole::Llm,
+                            format!(
+                                "已回滚快照（trace_id={}），影响文件数={}：\n{}",
+                                result.trace_id,
+                                result.files.len(),
+                                result
+                                    .files
+                                    .iter()
+                                    .map(|path| format!("- {path}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            ),
+                            false,
+                        ),
+                        Err(error) => self.push_chat_message(
+                            ChatRole::Error,
+                            format!("回滚失败：{error}"),
+                            false,
+                        ),
+                    },
+                    None => match guard.rollback_last() {
+                        Ok(Some(result)) => self.push_chat_message(
+                            ChatRole::Llm,
+                            format!(
+                                "已回滚最近一次快照（trace_id={}），影响文件数={}：\n{}",
+                                result.trace_id,
+                                result.files.len(),
+                                result
+                                    .files
+                                    .iter()
+                                    .map(|path| format!("- {path}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            ),
+                            false,
+                        ),
+                        Ok(None) => self.push_chat_message(
+                            ChatRole::Error,
+                            "未找到可回滚的快照".to_string(),
+                            false,
+                        ),
+                        Err(error) => self.push_chat_message(
+                            ChatRole::Error,
+                            format!("回滚失败：{error}"),
+                            false,
+                        ),
+                    },
+                }
+            }
+            "/status" => {
+                if let Err(error) = self.show_status_summary() {
+                    self.push_chat_message(
+                        ChatRole::Error,
+                        format!("状态查询失败：{error}"),
+                        false,
+                    );
+                }
+            }
             "/settings" => {
                 // 配置入口：默认探测 Codex，并在可用时写入模型配置文件。
                 //
@@ -817,6 +1060,7 @@ impl OrderTui<'_> {
             api_key.clone(),
             model_name.to_string(),
             false,
+            None,
         );
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -882,97 +1126,465 @@ impl OrderTui<'_> {
         Ok(current_dir.join(".order").join("model.json"))
     }
 
-    /// 将用户输入发送给当前配置的大模型。
+    /// 启动一次新的流式补全请求，并把执行交给后台线程。
     ///
-    /// 设计说明：
-    /// - 复用 `Connection` 配置对象，但每次请求重建底层 `client`，避免 tools 在旧 runtime 上失效；
-    /// - 每次请求都显式携带历史消息，避免模型把当前输入当作“全新会话”；
-    /// - 当前事件循环是同步的，因此这里用一个轻量 `tokio` 运行时阻塞等待异步响应；
-    /// - 成功时返回响应文本，供对话区展示。
-    fn send_prompt_to_llm(&mut self, prompt: String) -> anyhow::Result<String> {
+    /// 这里先将用户消息与助手占位消息放入对话区，但默认不持久化：
+    /// 只有请求真正成功结束后才转为持久消息，避免取消/失败污染后续上下文。
+    fn start_streaming_completion(&mut self, prompt: String) -> anyhow::Result<()> {
         self.ensure_connection()?;
         let chat_history = self.build_chat_history_for_llm(&prompt);
-
         let connection = self
             .connection
-            .as_mut()
-            .context("LLM 连接初始化后仍不可用")?;
+            .as_ref()
+            .context("LLM 连接初始化后仍不可用")?
+            .clone();
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("创建异步运行时失败")?;
+        let trace_id = new_trace_id();
+        let workspace_root = workspace_root_best_effort();
+        log_event_best_effort(
+            &workspace_root,
+            AgentEvent::TuiInput {
+                ts: ts(),
+                trace_id: trace_id.clone(),
+                input_len: prompt.chars().count(),
+            },
+        );
 
-        runtime
-            .block_on(connection.response_with_history(prompt, chat_history))
-            .map_err(|e| {
-                let mut full_msg = e.to_string();
-                let mut source = e.source();
-                while let Some(err) = source {
-                    full_msg.push_str(&format!("\n  原因: {}", err));
-                    source = err.source();
+        let user_message_index = self
+            .push_chat_message_with_index(ChatRole::User, prompt.clone(), false)
+            .context("用户消息入队失败")?;
+        let assistant_message_index = self
+            .push_chat_message_with_index(ChatRole::Llm, "正在生成...".to_string(), false)
+            .context("助手占位消息入队失败")?;
+
+        let (sender, receiver) = mpsc::channel::<CompletionWorkerEvent>();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        Self::spawn_completion_worker(
+            connection,
+            trace_id.clone(),
+            prompt,
+            chat_history,
+            sender,
+            cancel_flag.clone(),
+        );
+
+        self.active_completion = Some(ActiveCompletion {
+            trace_id,
+            receiver,
+            cancel_flag,
+            user_message_index,
+            assistant_message_index,
+            received_delta: false,
+            last_tool_progress: Some("请求已发送，等待首个增量...".to_string()),
+            started_at: Instant::now(),
+        });
+        self.last_failure = None;
+        Ok(())
+    }
+
+    /// 创建后台线程执行模型请求，避免阻塞 TUI 主事件循环。
+    fn spawn_completion_worker(
+        mut connection: Connection,
+        trace_id: String,
+        prompt: String,
+        history: Vec<RigMessage>,
+        sender: Sender<CompletionWorkerEvent>,
+        cancel_flag: Arc<AtomicBool>,
+    ) {
+        thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = sender.send(CompletionWorkerEvent::Completed(Err(format!(
+                        "创建异步运行时失败：{error}"
+                    ))));
+                    return;
                 }
-                anyhow::anyhow!("向 LLM 发送消息失败: {}", full_msg)
-            })
+            };
+
+            let result = runtime.block_on(Self::run_completion_worker(
+                &mut connection,
+                trace_id,
+                prompt,
+                history,
+                sender.clone(),
+                cancel_flag,
+            ));
+
+            let mapped = result.map(|_| ()).map_err(|error| error.to_string());
+            let _ = sender.send(CompletionWorkerEvent::Completed(mapped));
+        });
+    }
+
+    /// 后台线程中的请求执行逻辑：流式拉取 + 超时控制 + 指数退避重试。
+    async fn run_completion_worker(
+        connection: &mut Connection,
+        trace_id: String,
+        prompt: String,
+        history: Vec<RigMessage>,
+        sender: Sender<CompletionWorkerEvent>,
+        cancel_flag: Arc<AtomicBool>,
+    ) -> anyhow::Result<()> {
+        const MAX_ATTEMPTS: u32 = 3;
+        const REQUEST_TIMEOUT_SECS: u64 = 90;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Err(anyhow!("请求已取消"));
+            }
+
+            let emitted_delta = Arc::new(AtomicBool::new(false));
+            let emitted_delta_for_stream = emitted_delta.clone();
+            let sender_for_stream = sender.clone();
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(REQUEST_TIMEOUT_SECS),
+                connection.response_with_history_streamed_traced(
+                    trace_id.clone(),
+                    prompt.clone(),
+                    history.clone(),
+                    cancel_flag.as_ref(),
+                    move |event| {
+                        if matches!(event, ModelStreamEvent::Delta { .. }) {
+                            emitted_delta_for_stream.store(true, Ordering::Relaxed);
+                        }
+                        let _ = sender_for_stream.send(CompletionWorkerEvent::Stream(event));
+                    },
+                ),
+            )
+            .await;
+
+            let error_message = match result {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => format!("请求超时（>{REQUEST_TIMEOUT_SECS}s）"),
+            };
+
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Err(anyhow!("请求已取消"));
+            }
+
+            let can_retry = attempt < MAX_ATTEMPTS
+                && !emitted_delta.load(Ordering::Relaxed)
+                && Self::is_retryable_stream_error(&error_message);
+            if can_retry {
+                let delay = Self::retry_backoff_with_jitter(attempt);
+                let _ = sender.send(CompletionWorkerEvent::Stream(
+                    ModelStreamEvent::ToolProgress {
+                        message: format!(
+                            "第 {attempt} 次请求失败：{}；将在 {}ms 后重试",
+                            shorten_reason(&error_message, 80),
+                            delay.as_millis()
+                        ),
+                    },
+                ));
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            return Err(anyhow!(error_message));
+        }
+
+        Err(anyhow!("请求失败：已超过最大重试次数"))
+    }
+
+    /// 判断错误是否可重试（网络抖动、限流、网关瞬时故障等）。
+    fn is_retryable_stream_error(error: &str) -> bool {
+        let normalized = error.to_ascii_lowercase();
+        if normalized.contains("请求已取消") || normalized.contains("cancel") {
+            return false;
+        }
+
+        [
+            "timeout",
+            "timed out",
+            "429",
+            "rate limit",
+            "connection reset",
+            "connection refused",
+            "broken pipe",
+            "temporarily unavailable",
+            "service unavailable",
+            "gateway timeout",
+            "bad gateway",
+            "502",
+            "503",
+            "504",
+            "network",
+            "dns",
+            "transport",
+        ]
+        .iter()
+        .any(|keyword| normalized.contains(keyword))
+    }
+
+    /// 计算指数退避 + 抖动延迟，避免并发失败时重试风暴。
+    fn retry_backoff_with_jitter(attempt: u32) -> Duration {
+        let base_ms: u64 = 600;
+        let cap_ms: u64 = 8_000;
+        let exp = 2u64.saturating_pow(attempt.saturating_sub(1));
+        let backoff_ms = (base_ms.saturating_mul(exp)).min(cap_ms);
+
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0);
+        let jitter_bound = backoff_ms / 3 + 1;
+        let jitter_ms = seed % jitter_bound;
+        Duration::from_millis(backoff_ms.saturating_add(jitter_ms))
+    }
+
+    /// 拉取后台线程事件并增量更新对话区。
+    fn poll_active_completion_events(&mut self) {
+        let mut buffered = Vec::new();
+
+        if let Some(active) = self.active_completion.as_mut() {
+            loop {
+                match active.receiver.try_recv() {
+                    Ok(event) => buffered.push(event),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        buffered.push(CompletionWorkerEvent::Completed(Err(
+                            "后台补全线程异常退出".to_string(),
+                        )));
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in buffered {
+            match event {
+                CompletionWorkerEvent::Stream(stream_event) => {
+                    self.handle_completion_stream_event(stream_event);
+                }
+                CompletionWorkerEvent::Completed(result) => {
+                    self.finalize_active_completion(result);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// 处理单个流式事件并更新占位消息。
+    fn handle_completion_stream_event(&mut self, event: ModelStreamEvent) {
+        match event {
+            ModelStreamEvent::Delta { content } => {
+                let (index, received_delta_before) = match self.active_completion.as_ref() {
+                    Some(active) => (active.assistant_message_index, active.received_delta),
+                    None => return,
+                };
+                if let Some(message) = self.messages.get_mut(index) {
+                    if received_delta_before {
+                        message.content.push_str(&content);
+                    } else {
+                        message.content = content;
+                    }
+                }
+                if let Some(active) = self.active_completion.as_mut() {
+                    active.received_delta = true;
+                    active.last_tool_progress = None;
+                }
+            }
+            ModelStreamEvent::ToolProgress { message } => {
+                if let Some(active) = self.active_completion.as_mut() {
+                    active.last_tool_progress = Some(message);
+                }
+            }
+            ModelStreamEvent::Done => {
+                if let Some(active) = self.active_completion.as_mut() {
+                    active.last_tool_progress = Some("响应已完成".to_string());
+                }
+            }
+            ModelStreamEvent::Error { message } => {
+                if let Some(active) = self.active_completion.as_mut() {
+                    active.last_tool_progress = Some(shorten_reason(&message, 80));
+                }
+            }
+        }
+    }
+
+    /// 结束当前请求并处理成功/失败收尾逻辑。
+    fn finalize_active_completion(&mut self, result: Result<(), String>) {
+        let Some(active) = self.active_completion.take() else {
+            return;
+        };
+
+        let workspace_root = workspace_root_best_effort();
+        let output_len = self
+            .messages
+            .get(active.assistant_message_index)
+            .map(|message| message.content.chars().count());
+
+        match result {
+            Ok(()) => {
+                if let Some(user_message) = self.messages.get_mut(active.user_message_index) {
+                    user_message.persist_to_history = true;
+                }
+                if let Some(assistant_message) =
+                    self.messages.get_mut(active.assistant_message_index)
+                {
+                    assistant_message.persist_to_history = true;
+                }
+
+                if let Err(error) = self.persist_history() {
+                    eprintln!("failed to persist history: {error}");
+                }
+                if let Err(error) = self.persist_context_memory() {
+                    eprintln!("failed to persist context memory: {error}");
+                }
+
+                log_event_best_effort(
+                    &workspace_root,
+                    AgentEvent::TuiOutput {
+                        ts: ts(),
+                        trace_id: active.trace_id.clone(),
+                        ok: true,
+                        output_len,
+                        error: None,
+                    },
+                );
+                self.last_failure = None;
+            }
+            Err(error_message) => {
+                let cancelled = error_message.contains("请求已取消");
+                if cancelled {
+                    // 取消场景直接移除当前轮次，确保不会污染后续上下文与历史。
+                    self.discard_pending_turn(
+                        active.user_message_index,
+                        active.assistant_message_index,
+                    );
+                    self.push_chat_message(
+                        ChatRole::Llm,
+                        format!("已取消当前请求（trace_id={}）", active.trace_id),
+                        false,
+                    );
+                    self.last_failure = None;
+                } else {
+                    let reason = shorten_reason(&error_message, 80);
+                    self.last_failure = Some(FailureSummary {
+                        trace_id: active.trace_id.clone(),
+                        reason: reason.clone(),
+                    });
+                    self.push_chat_message(
+                        ChatRole::Error,
+                        format!(
+                            "发送失败（trace_id={}）：{}",
+                            active.trace_id, error_message
+                        ),
+                        false,
+                    );
+                }
+
+                log_event_best_effort(
+                    &workspace_root,
+                    AgentEvent::TuiOutput {
+                        ts: ts(),
+                        trace_id: active.trace_id,
+                        ok: false,
+                        output_len: None,
+                        error: Some(shorten_reason(&error_message, 80)),
+                    },
+                );
+            }
+        }
+    }
+
+    /// 发起取消信号；真正结束由后台线程回传 `Completed` 事件统一收尾。
+    fn cancel_active_completion(&mut self, status: String) {
+        if let Some(active) = self.active_completion.as_mut() {
+            active.cancel_flag.store(true, Ordering::Relaxed);
+            active.last_tool_progress = Some(status);
+        }
+    }
+
+    /// 丢弃当前未完成轮次，避免取消后留下半截消息影响后续会话。
+    fn discard_pending_turn(&mut self, user_index: usize, assistant_index: usize) {
+        let mut indexes = [user_index, assistant_index];
+        indexes.sort_by(|left, right| right.cmp(left));
+        for index in indexes {
+            if index < self.messages.len() {
+                self.messages.remove(index);
+            }
+        }
     }
 
     /// 构建发送给 LLM 的历史上下文。
     ///
     /// 关键策略：
-    /// - 仅保留真实会话消息（`persist_to_history = true`），避免把 `/history` 回显污染上下文；
-    /// - 跳过“当前这次用户输入”，因为它会作为 `prompt` 单独传入，避免重复；
-    /// - 忽略 `Error` 消息，避免把本地异常文案当成模型语义上下文；
-    /// - 限制历史条数，降低超长会话导致的上下文溢出风险。
-    fn build_chat_history_for_llm(&self, current_prompt: &str) -> Vec<RigMessage> {
-        const MAX_HISTORY_MESSAGES_FOR_LLM: usize = 120;
+    /// - 采用三层上下文：短期上下文 + 中期摘要 + 长期记忆；
+    /// - 中期摘要仅在历史发生裁剪时注入，避免短会话噪声；
+    /// - 长期记忆按任务 ID 持久化并按需注入；
+    /// - 同步回写 `context_remaining`，用于输入框右上角的剩余百分比提示。
+    fn build_chat_history_for_llm(&mut self, current_prompt: &str) -> Vec<RigMessage> {
+        let context_messages = self.context_messages_for_manager();
+        let limits = self.current_model_limits();
+        let build_result =
+            self.context_manager
+                .build_history(current_prompt, &context_messages, limits);
 
-        let latest_user_index = self
-            .messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, message)| {
-                message.persist_to_history
-                    && matches!(message.role, ChatRole::User)
-                    && message.content == current_prompt
-            })
-            .map(|(index, _)| index);
-
-        let mut history = self
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, message)| message.persist_to_history)
-            .filter_map(|(index, message)| {
-                if Some(index) == latest_user_index {
-                    return None;
-                }
-
-                match message.role {
-                    ChatRole::User => Some(RigMessage::user(message.content.clone())),
-                    ChatRole::Llm => Some(RigMessage::assistant(message.content.clone())),
-                    ChatRole::Error => None,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        if history.len() > MAX_HISTORY_MESSAGES_FOR_LLM {
-            let overflow = history.len() - MAX_HISTORY_MESSAGES_FOR_LLM;
-            history.drain(0..overflow);
-        }
-
-        history
+        self.context_remaining = build_result.context_remaining;
+        build_result.history
     }
 
-    /// 向对话流追加一条消息。
+    /// 将运行时消息转换为上下文管理器可消费的结构。
+    fn context_messages_for_manager(&self) -> Vec<ContextMessage> {
+        self.messages
+            .iter()
+            .map(|message| {
+                let role = match message.role {
+                    ChatRole::User => ContextRole::User,
+                    ChatRole::Llm => ContextRole::Assistant,
+                    ChatRole::Error => ContextRole::Error,
+                };
+                ContextMessage {
+                    role,
+                    content: message.content.clone(),
+                    persist_to_history: message.persist_to_history,
+                }
+            })
+            .collect()
+    }
+
+    /// 读取当前模型上下文限制参数。
     ///
-    /// 为防止内存无限增长，仅保留最近 200 条消息。
-    fn push_chat_message(&mut self, role: ChatRole, content: String, persist_to_history: bool) {
+    /// 若读取失败或模型未配置，则回退为 0（交由压缩器使用默认预算）。
+    fn current_model_limits(&self) -> ContextModelLimits {
+        if let Ok(Some(model_info)) = get_current_model_info() {
+            ContextModelLimits {
+                model_max_context: model_info.model_max_context,
+                model_max_tokens: model_info.model_max_tokens,
+                model_max_output: model_info.model_max_output,
+            }
+        } else {
+            ContextModelLimits::default()
+        }
+    }
+
+    /// 将当前会话增量同步到长期记忆文件。
+    fn persist_context_memory(&mut self) -> anyhow::Result<()> {
+        let context_messages = self.context_messages_for_manager();
+        self.context_manager
+            .update_long_term_memory(&context_messages)
+    }
+
+    /// 向对话流追加一条消息并返回其索引。
+    ///
+    /// 返回 `None` 表示内容为空白被忽略。
+    fn push_chat_message_with_index(
+        &mut self,
+        role: ChatRole,
+        content: String,
+        persist_to_history: bool,
+    ) -> Option<usize> {
         const MAX_MESSAGES: usize = 200;
 
         let normalized_content = content.trim().to_string();
         if normalized_content.is_empty() {
-            return;
+            return None;
         }
 
         self.messages.push(ChatMessage {
@@ -980,17 +1592,33 @@ impl OrderTui<'_> {
             content: normalized_content,
             persist_to_history,
         });
+        let mut index = self.messages.len().saturating_sub(1);
 
         if self.messages.len() > MAX_MESSAGES {
             let overflow = self.messages.len() - MAX_MESSAGES;
             self.messages.drain(0..overflow);
+            // 溢出裁剪会导致索引左移，这里同步修正返回值。
+            index = index.saturating_sub(overflow);
         }
 
         // 消息入队后立即尝试持久化到运行目录。
-        // 历史写入失败不影响主流程，仅通过标准错误输出告警。
-        if persist_to_history && let Err(error) = self.persist_history() {
-            eprintln!("failed to persist history: {error}");
+        // 历史/长期记忆写入失败都不影响主流程，仅通过标准错误输出告警。
+        if persist_to_history {
+            if let Err(error) = self.persist_history() {
+                eprintln!("failed to persist history: {error}");
+            }
+            if let Err(error) = self.persist_context_memory() {
+                eprintln!("failed to persist context memory: {error}");
+            }
         }
+        Some(index)
+    }
+
+    /// 向对话流追加一条消息。
+    ///
+    /// 为防止内存无限增长，仅保留最近 200 条消息。
+    fn push_chat_message(&mut self, role: ChatRole, content: String, persist_to_history: bool) {
+        let _ = self.push_chat_message_with_index(role, content, persist_to_history);
     }
 
     /// 将当前对话消息持久化到运行目录下的 `History.json`。
@@ -1333,6 +1961,7 @@ impl OrderTui<'_> {
             model_info.token,
             model_info.model_name,
             model_info.support_tools,
+            model_info.capabilities,
         ));
 
         Ok(())
@@ -1450,6 +2079,111 @@ impl OrderTui<'_> {
         lines
     }
 
+    /// 展示最近 24 小时的结构化日志统计（成功率/耗时/重试率）。
+    ///
+    /// 统计口径：
+    /// - 以 `AgentEvent::RequestEnd` 为“完成一次请求”的标记；
+    /// - `attempts > 1` 视为发生过降级重试；
+    /// - 只统计最近 24 小时（跨天会读取昨日与今日日志文件）。
+    fn show_status_summary(&mut self) -> anyhow::Result<()> {
+        let workspace_root = workspace_root_best_effort();
+        let logs_dir = workspace_root.join(".order").join("logs");
+        if !logs_dir.exists() {
+            self.push_chat_message(
+                ChatRole::Error,
+                "未找到日志目录：.order/logs/（尚未产生可统计事件）".to_string(),
+                false,
+            );
+            return Ok(());
+        }
+
+        let now = Local::now();
+        let today = now.format("%Y%m%d").to_string();
+        let yesterday = (now - ChronoDuration::days(1)).format("%Y%m%d").to_string();
+        let candidates = [
+            logs_dir.join(format!("agent-{yesterday}.log")),
+            logs_dir.join(format!("agent-{today}.log")),
+        ];
+
+        let cutoff = Utc::now() - ChronoDuration::hours(24);
+        let mut total: u64 = 0;
+        let mut success: u64 = 0;
+        let mut sum_duration_ms: u128 = 0;
+        let mut retry: u64 = 0;
+
+        for path in candidates {
+            if !path.exists() {
+                continue;
+            }
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("读取日志失败: {}", path.display()))?;
+            for line in content.lines() {
+                let text = line.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let Ok(event) = serde_json::from_str::<AgentEvent>(text) else {
+                    continue;
+                };
+                let AgentEvent::RequestEnd {
+                    ts,
+                    ok,
+                    duration_ms,
+                    attempts,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+
+                let Ok(parsed) = DateTime::parse_from_rfc3339(&ts) else {
+                    continue;
+                };
+                let event_time = parsed.with_timezone(&Utc);
+                if event_time < cutoff {
+                    continue;
+                }
+
+                total += 1;
+                sum_duration_ms += duration_ms;
+                if ok {
+                    success += 1;
+                }
+                if attempts > 1 {
+                    retry += 1;
+                }
+            }
+        }
+
+        if total == 0 {
+            self.push_chat_message(
+                ChatRole::Llm,
+                "最近 24 小时内没有可统计的请求记录（RequestEnd 事件为 0）".to_string(),
+                false,
+            );
+            return Ok(());
+        }
+
+        let success_rate = (success as f64 / total as f64) * 100.0;
+        let avg_duration = sum_duration_ms / total as u128;
+        let retry_rate = (retry as f64 / total as f64) * 100.0;
+
+        let mut summary = format!(
+            "近 24h 统计：总请求={} 成功={} 成功率={:.2}% 平均耗时={}ms 重试率={:.2}%",
+            total, success, success_rate, avg_duration, retry_rate
+        );
+        if let Some(ref failure) = self.last_failure {
+            summary.push_str(&format!(
+                "\n最近失败：trace_id={} 原因={}",
+                failure.trace_id, failure.reason
+            ));
+        }
+        summary.push_str(&format!("\n日志目录：{}", logs_dir.display()));
+
+        self.push_chat_message(ChatRole::Llm, summary, false);
+        Ok(())
+    }
+
     /// 进入 editor 子界面，退出后回到主界面。
     fn launch_editor(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
         let mut editor = Editor::default();
@@ -1458,6 +2192,28 @@ impl OrderTui<'_> {
         self.last_tick = Instant::now();
         Ok(())
     }
+}
+
+/// 截断错误原因，避免状态栏被长文本撑爆。
+fn shorten_reason(text: &str, max_chars: usize) -> String {
+    let mut line = text.lines().next().unwrap_or(text).trim().to_string();
+    if line.starts_with("[trace_id=") {
+        if let Some(index) = line.find("] ") {
+            line = line[index + 2..].trim().to_string();
+        }
+    }
+
+    let char_count = line.chars().count();
+    if char_count <= max_chars {
+        return line;
+    }
+
+    let mut shortened = line
+        .chars()
+        .take(max_chars.saturating_sub(2))
+        .collect::<String>();
+    shortened.push_str("..");
+    shortened
 }
 
 #[cfg(test)]
@@ -1522,8 +2278,12 @@ mod tests {
             .push(chat_message(ChatRole::User, "当前问题", true));
 
         let history = tui.build_chat_history_for_llm("当前问题");
-        assert_eq!(history.len(), 120);
-        assert_eq!(history.first(), Some(&RigMessage::user("u70")));
+        assert_eq!(history.len(), 121);
+        assert!(
+            format!("{:?}", history[0]).contains("阶段摘要"),
+            "历史裁剪后应注入中期摘要"
+        );
+        assert_eq!(history.get(1), Some(&RigMessage::user("u70")));
         assert_eq!(history.last(), Some(&RigMessage::assistant("a129")));
     }
 }
@@ -1533,6 +2293,21 @@ impl Widget for &OrderTui<'_> {
         let input_height = self.input_state.required_height(area.width);
         let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(input_height)]);
         let [main_area, input_area] = layout.areas(area);
+        let status_message = if let Some(active) = self.active_completion.as_ref() {
+            let elapsed = active.started_at.elapsed().as_secs();
+            let progress = active
+                .last_tool_progress
+                .clone()
+                .unwrap_or_else(|| "流式响应中，Ctrl+C 可取消".to_string());
+            Some(format!(
+                "进行中({}s) {} {}",
+                elapsed, active.trace_id, progress
+            ))
+        } else {
+            self.last_failure
+                .as_ref()
+                .map(|item| format!("最近失败: {} {}", item.trace_id, item.reason))
+        };
 
         // 历史选择界面优先渲染。
         if self.history_browser.is_some() {
@@ -1551,10 +2326,12 @@ impl Widget for &OrderTui<'_> {
                 Paragraph::new(Text::from(lines)).render(history_inner, buf);
             }
 
-            InputWidget::new(&self.input_state)
-                .set_context_remaining(self.context_remaining)
-                .clone()
-                .render(input_area, buf);
+            let mut widget = InputWidget::new(&self.input_state);
+            widget.set_context_remaining(self.context_remaining);
+            if let Some(ref message) = status_message {
+                widget.set_status_message(message.clone());
+            }
+            widget.clone().render(input_area, buf);
             return;
         }
 
@@ -1594,10 +2371,12 @@ impl Widget for &OrderTui<'_> {
                 }
             }
 
-            InputWidget::new(&self.input_state)
-                .set_context_remaining(self.context_remaining)
-                .clone()
-                .render(input_area, buf);
+            let mut widget = InputWidget::new(&self.input_state);
+            widget.set_context_remaining(self.context_remaining);
+            if let Some(ref message) = status_message {
+                widget.set_status_message(message.clone());
+            }
+            widget.clone().render(input_area, buf);
             return;
         }
 
@@ -1642,6 +2421,9 @@ impl Widget for &OrderTui<'_> {
             ("/help", "Show help information"),
             ("/exit", "Exit the application"),
             ("/cancel", "Cancel latest operation"),
+            ("/approve", "Approve pending writes by trace_id"),
+            ("/reject", "Reject pending writes by trace_id"),
+            ("/rollback", "Rollback snapshot by trace_id (or latest)"),
             (
                 "/history",
                 "Open history browser; /history N; /history clear",
@@ -1667,9 +2449,11 @@ impl Widget for &OrderTui<'_> {
         }
         Paragraph::new(Text::from(lines)).render(commands_area, buf);
 
-        InputWidget::new(&self.input_state)
-            .set_context_remaining(self.context_remaining)
-            .clone()
-            .render(input_area, buf);
+        let mut widget = InputWidget::new(&self.input_state);
+        widget.set_context_remaining(self.context_remaining);
+        if let Some(ref message) = status_message {
+            widget.set_status_message(message.clone());
+        }
+        widget.clone().render(input_area, buf);
     }
 }

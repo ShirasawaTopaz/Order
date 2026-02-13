@@ -16,6 +16,8 @@ use super::utils::{char_count, char_to_byte_index, file_name_or, is_word_char};
 pub enum EditorMode {
     Normal,
     Insert,
+    /// 视觉模式：先提供 Vim 风格的进入/退出体验，避免在未实现选区时误触普通命令。
+    Visual,
     Terminal,
     BufferPicker,
 }
@@ -129,6 +131,19 @@ pub(super) struct TreeEntry {
     pub(super) depth: usize,
     pub(super) is_dir: bool,
     pub(super) name: String,
+}
+
+/// editor 展示层使用的补全候选。
+///
+/// 设计为结构体而不是字符串，目的是同时保留：
+/// - `label`：用于 popover 展示；
+/// - `insert_text`：用于真正插入到缓冲区；
+/// - `detail`：用于展示更完整的 LSP 上下文提示。
+#[derive(Debug, Clone)]
+pub(super) struct CompletionDisplayItem {
+    pub(super) label: String,
+    pub(super) insert_text: String,
+    pub(super) detail: Option<String>,
 }
 
 // 功能说明：见下方实现。
