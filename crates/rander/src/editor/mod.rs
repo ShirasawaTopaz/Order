@@ -369,15 +369,11 @@ impl Editor {
     ///
     /// 通过“路径定位 -> 全量替换”策略，避免跨 buffer 残留旧补全数据。
     fn apply_lsp_completion_items(&mut self, file_path: &Path, items: Vec<lsp::LspCompletionItem>) {
-        let Some(buffer_idx) = self
-            .buffers
-            .iter()
-            .position(|buffer| {
-                buffer.path.as_ref().is_some_and(|p| {
-                    p == file_path || p.canonicalize().ok() == file_path.canonicalize().ok()
-                })
+        let Some(buffer_idx) = self.buffers.iter().position(|buffer| {
+            buffer.path.as_ref().is_some_and(|p| {
+                p == file_path || p.canonicalize().ok() == file_path.canonicalize().ok()
             })
-        else {
+        }) else {
             return;
         };
 

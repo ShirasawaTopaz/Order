@@ -344,12 +344,8 @@ impl LspClient {
             return Ok(());
         }
 
-        let file_uri = protocol::path_to_file_uri(file_path).with_context(|| {
-            format!(
-                "willSaveWaitUntil 路径转换失败: {}",
-                file_path.display()
-            )
-        })?;
+        let file_uri = protocol::path_to_file_uri(file_path)
+            .with_context(|| format!("willSaveWaitUntil 路径转换失败: {}", file_path.display()))?;
         let request_id = session.next_request_id();
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -645,10 +641,7 @@ impl LspSession {
 
         if let Some(file_path) = self.pending_completion.remove(&request_id) {
             let items = protocol::parse_completion_items_from_response(&response);
-            return Some(LspEvent::CompletionItems {
-                file_path,
-                items,
-            });
+            return Some(LspEvent::CompletionItems { file_path, items });
         }
 
         if let Some(file_path) = self.pending_semantic_tokens.remove(&request_id) {
@@ -666,12 +659,8 @@ impl LspSession {
     }
 
     fn send_initialize_sequence(&mut self, workspace_root: &Path) -> Result<()> {
-        let root_uri = protocol::path_to_file_uri(workspace_root).with_context(|| {
-            format!(
-                "工作区路径无法转换为 URI: {}",
-                workspace_root.display()
-            )
-        })?;
+        let root_uri = protocol::path_to_file_uri(workspace_root)
+            .with_context(|| format!("工作区路径无法转换为 URI: {}", workspace_root.display()))?;
 
         let initialize_request_id = self.next_request_id();
         self.initialize_request_id = Some(initialize_request_id);

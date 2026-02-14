@@ -14,9 +14,7 @@ use super::{
         CompletionDisplayItem, EditorBuffer, EditorMode, MainFocus, PaneFocus, SplitDirection,
         TabState,
     },
-    utils::{
-        contains_point, file_name_or, is_completion_trigger_char, is_normal_command_prefix,
-    },
+    utils::{contains_point, file_name_or, is_completion_trigger_char, is_normal_command_prefix},
 };
 
 const COMPLETION_VISIBLE_COUNT: usize = 7;
@@ -267,21 +265,19 @@ impl Editor {
                     self.open_selected_tree_entry();
                 }
             }
-            KeyCode::Char(ch) if self.main_focus == MainFocus::Tree => {
-                match ch {
-                    'j' => self.tree_select_next(),
-                    'k' => self.tree_select_prev(),
-                    'l' => self.open_selected_tree_entry(),
-                    'h' => {
-                        if self.tree_entries.is_empty() {
-                            return;
-                        }
-                        let path = self.tree_entries[self.tree_selected].path.clone();
-                        self.toggle_expand_dir(path);
+            KeyCode::Char(ch) if self.main_focus == MainFocus::Tree => match ch {
+                'j' => self.tree_select_next(),
+                'k' => self.tree_select_prev(),
+                'l' => self.open_selected_tree_entry(),
+                'h' => {
+                    if self.tree_entries.is_empty() {
+                        return;
                     }
-                    _ => {}
+                    let path = self.tree_entries[self.tree_selected].path.clone();
+                    self.toggle_expand_dir(path);
                 }
-            }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -925,7 +921,10 @@ impl Editor {
 
         let buffer = self.active_buffer();
         let prefix_opt = buffer.word_prefix();
-        let prefix_str = prefix_opt.as_ref().map(|(_, _, p)| p.as_str()).unwrap_or("");
+        let prefix_str = prefix_opt
+            .as_ref()
+            .map(|(_, _, p)| p.as_str())
+            .unwrap_or("");
 
         let prefix_lower = prefix_str.to_lowercase();
         let mut candidates: BTreeMap<String, CompletionDisplayItem> = BTreeMap::new();
@@ -973,7 +972,11 @@ impl Editor {
 
     fn request_completion_for_active_buffer(&mut self) {
         let buffer_idx = self.tabs[self.active_tab].buffer_index;
-        let Some(path) = self.buffers.get(buffer_idx).and_then(|buffer| buffer.path.clone()) else {
+        let Some(path) = self
+            .buffers
+            .get(buffer_idx)
+            .and_then(|buffer| buffer.path.clone())
+        else {
             return;
         };
 
@@ -1137,8 +1140,8 @@ impl Editor {
         // 记录发送 didOpen 前的运行态，用于判断本次是否触发了语言服务冷启动。
         // 只有冷启动场景才展示“项目加载中”提示，避免在日常文件切换时反复打扰。
         let language = lsp::detect_language_from_path_or_name(Some(&path), "");
-        let started_from_cold = language
-            .is_some_and(|detected| !self.lsp_client.is_language_running(detected));
+        let started_from_cold =
+            language.is_some_and(|detected| !self.lsp_client.is_language_running(detected));
 
         match self
             .lsp_client
@@ -1150,7 +1153,8 @@ impl Editor {
                 {
                     self.mark_lsp_project_loading(detected);
                 } else {
-                    self.status_message = format!("已打开：{}（LSP didOpen 已发送）", path.display());
+                    self.status_message =
+                        format!("已打开：{}（LSP didOpen 已发送）", path.display());
                 }
                 if let Some(buffer_mut) = self.buffers.get_mut(buffer_idx) {
                     buffer_mut.lsp_dirty = false;

@@ -361,9 +361,9 @@ pub fn path_to_file_uri(path: &Path) -> Result<String> {
             .context("获取当前目录失败")?
             .join(path)
     };
-    
+
     let mut display = absolute.to_string_lossy().replace('\\', "/");
-    
+
     // 移除 Windows 扩展长度路径前缀
     if display.starts_with("//?/") {
         display = display[4..].to_string();
@@ -400,7 +400,7 @@ pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
 fn urlencoding_decode(s: &str) -> Result<String, ()> {
     let mut result = String::new();
     let mut chars = s.chars().peekable();
-    
+
     while let Some(c) = chars.next() {
         if c == '%' {
             let hex: String = chars.by_ref().take(2).collect();
@@ -417,7 +417,7 @@ fn urlencoding_decode(s: &str) -> Result<String, ()> {
             result.push(c);
         }
     }
-    
+
     Ok(result)
 }
 

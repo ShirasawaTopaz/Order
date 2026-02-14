@@ -272,7 +272,8 @@ impl Editor {
         let mut lines = Vec::new();
         let end = min(buffer.lines.len(), buffer.scroll_row + visible);
         let is_markdown = Self::is_markdown_buffer(buffer);
-        let lsp_language = lsp::detect_language_from_path_or_name(buffer.path.as_deref(), &buffer.name);
+        let lsp_language =
+            lsp::detect_language_from_path_or_name(buffer.path.as_deref(), &buffer.name);
         let use_semantic_highlight = Self::can_use_lsp_semantic_highlight(buffer);
         let mut markdown_fence_language = if is_markdown {
             Self::markdown_fence_language_before(buffer, buffer.scroll_row)
@@ -306,8 +307,7 @@ impl Editor {
                     Self::highlight_line_with_lsp_tokens(line, &semantic_tokens, palette);
                 spans.append(&mut highlighted);
             } else if let Some(language) = lsp_language {
-                let mut highlighted =
-                    Self::highlight_line_with_syntect(line, language, palette);
+                let mut highlighted = Self::highlight_line_with_syntect(line, language, palette);
                 spans.append(&mut highlighted);
             } else {
                 spans.push(Span::styled(line.clone(), Style::default().fg(palette.fg)));
@@ -320,7 +320,7 @@ impl Editor {
 
         if focused {
             self.last_editor_inner_area = Some(inner);
-            
+
             let cursor_visible_row = buffer.cursor_row.saturating_sub(buffer.scroll_row);
             if cursor_visible_row < visible {
                 // 5 列偏移：4 位行号 + 1 个空格。
@@ -867,7 +867,11 @@ impl Editor {
             EditorMode::Terminal => "TERM",
             EditorMode::BufferPicker => "BUFFER",
         };
-        let lsp_indicator = if self.lsp_client.is_running() { "●" } else { "○" };
+        let lsp_indicator = if self.lsp_client.is_running() {
+            "●"
+        } else {
+            "○"
+        };
         let pending = if self.normal_pending.is_empty() {
             String::new()
         } else {
@@ -880,11 +884,7 @@ impl Editor {
         };
         let text = format!(
             " {}{}  LSP{}{}  {}",
-            mode,
-            pending,
-            lsp_indicator,
-            loading,
-            self.status_message
+            mode, pending, lsp_indicator, loading, self.status_message
         );
         Paragraph::new(text)
             .style(Style::default().bg(palette.bg).fg(palette.ok))
@@ -953,9 +953,15 @@ impl Editor {
         let max_height = (visible_count as u16).saturating_add(2);
 
         let editor_inner = self.last_editor_inner_area.unwrap_or(area);
-        
-        let popup_x = editor_inner.x.saturating_add(5).saturating_add(cursor_col as u16);
-        let popup_y = editor_inner.y.saturating_add(cursor_row as u16).saturating_add(1);
+
+        let popup_x = editor_inner
+            .x
+            .saturating_add(5)
+            .saturating_add(cursor_col as u16);
+        let popup_y = editor_inner
+            .y
+            .saturating_add(cursor_row as u16)
+            .saturating_add(1);
 
         let popup = Rect {
             x: popup_x.min(editor_inner.right().saturating_sub(max_width)),
@@ -1014,10 +1020,12 @@ impl Editor {
             } else {
                 0.0
             };
-            
-            let scrollbar_height = 1.max(visible_count.saturating_sub(max_scroll.min(visible_count)));
-            let scrollbar_pos = (scroll_ratio * (visible_count.saturating_sub(scrollbar_height)) as f32) as usize;
-            
+
+            let scrollbar_height =
+                1.max(visible_count.saturating_sub(max_scroll.min(visible_count)));
+            let scrollbar_pos =
+                (scroll_ratio * (visible_count.saturating_sub(scrollbar_height)) as f32) as usize;
+
             Some((scrollbar_pos, scrollbar_height))
         } else {
             None
@@ -1028,13 +1036,16 @@ impl Editor {
 
         for (idx, line) in lines.into_iter().enumerate() {
             if let Some((scrollbar_pos, scrollbar_height)) = scrollbar {
-                let has_scrollbar_char = idx >= scrollbar_pos && idx < scrollbar_pos + scrollbar_height;
+                let has_scrollbar_char =
+                    idx >= scrollbar_pos && idx < scrollbar_pos + scrollbar_height;
                 let scroll_char = if has_scrollbar_char { "█" } else { " " };
-                
+
                 let mut spans = line.spans;
                 let line_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
                 if line_len < content_width.saturating_sub(1) {
-                    spans.push(Span::raw(" ".repeat(content_width.saturating_sub(line_len + 1))));
+                    spans.push(Span::raw(
+                        " ".repeat(content_width.saturating_sub(line_len + 1)),
+                    ));
                 }
                 spans.push(Span::styled(
                     scroll_char.to_string(),
@@ -1049,8 +1060,12 @@ impl Editor {
         Paragraph::new(lines_with_scrollbar)
             .block(
                 Block::bordered()
-                    .title(format!(" Completion ({}/{}) ", self.completion_selected + 1, total_items))
-                    .border_style(Style::default().fg(palette.accent))
+                    .title(format!(
+                        " Completion ({}/{}) ",
+                        self.completion_selected + 1,
+                        total_items
+                    ))
+                    .border_style(Style::default().fg(palette.accent)),
             )
             .render(popup, frame.buffer_mut());
     }
@@ -1368,9 +1383,9 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::ThemeName;
     use super::*;
     use lsp::LspSemanticToken;
-    use super::super::types::ThemeName;
 
     fn test_palette() -> ThemePalette {
         ThemePalette::from_theme(ThemeName::MaterialOcean)
