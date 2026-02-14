@@ -599,9 +599,17 @@ impl Connection {
             .map_err(|error| TracedModelError::new(trace_id.clone(), error))?;
 
         if !negotiated.stream_enabled {
-            return self
+            let fallback = self
                 .response_with_history_as_single_event(trace_id, prompt, history, &mut on_event)
                 .await;
+            // 非流式回退失败时也要补发统一 `error` 事件，
+            // 避免上层在“回退分支”丢失错误状态提示。
+            if let Err(error) = &fallback {
+                on_event(ModelStreamEvent::Error {
+                    message: error.to_string(),
+                });
+            }
+            return fallback;
         }
 
         let stream_result: Result<String> = with_trace_id(trace_id.clone(), async {
@@ -618,8 +626,16 @@ impl Connection {
                 Ok(TracedModelResponse { trace_id, content })
             }
             Err(error) if Self::should_retry_without_stream(&error) => {
-                self.response_with_history_as_single_event(trace_id, prompt, history, &mut on_event)
-                    .await
+                let fallback = self
+                    .response_with_history_as_single_event(trace_id, prompt, history, &mut on_event)
+                    .await;
+                // streaming 不兼容后的降级调用若再次失败，同样需要发出 `error` 事件。
+                if let Err(fallback_error) = &fallback {
+                    on_event(ModelStreamEvent::Error {
+                        message: fallback_error.to_string(),
+                    });
+                }
+                fallback
             }
             Err(error) => {
                 on_event(ModelStreamEvent::Error {

@@ -15,3 +15,6 @@ core.workspace = true
 rander.workspace = true
 anyhow.workspace = true
 serde = "1.0.228"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = ["Win32_System_Console"] }

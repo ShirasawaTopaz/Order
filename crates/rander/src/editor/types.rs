@@ -20,6 +20,11 @@ pub enum EditorMode {
     Visual,
     Terminal,
     BufferPicker,
+    /// LSP rename 输入模式。
+    ///
+    /// 这里使用独立模式而非复用 NORMAL 命令串，是为了避免把“参数输入”与“命令触发”
+    /// 混在一起，降低误触发和命令前缀冲突的概率。
+    RenameInput,
 }
 
 // 功能说明：见下方实现。
@@ -350,6 +355,34 @@ impl EditorBuffer {
         ))
     }
 
+    /// 获取光标所在位置的完整单词。
+    ///
+    /// 与 `word_prefix` 的区别是：`word_prefix` 仅看光标左侧，
+    /// 而 rename 场景需要“光标位于单词内部也能抓到完整符号”，
+    /// 因此这里同时向左/向右扩展边界。
+    pub(super) fn word_at_cursor(&self) -> Option<(usize, usize, String)> {
+        let chars: Vec<char> = self.lines.get(self.cursor_row)?.chars().collect();
+        if chars.is_empty() {
+            return None;
+        }
+
+        let mut start = self.cursor_col.min(chars.len());
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+
+        let mut end = self.cursor_col.min(chars.len());
+        while end < chars.len() && is_word_char(chars[end]) {
+            end += 1;
+        }
+
+        if start == end {
+            return None;
+        }
+
+        Some((start, end, chars[start..end].iter().collect()))
+    }
+
     // 用补全内容替换前缀。
     pub(super) fn replace_prefix(&mut self, start: usize, end: usize, replacement: &str) {
         let line = &mut self.lines[self.cursor_row];
@@ -371,13 +404,7 @@ impl EditorBuffer {
                 generated
             }
         };
-        fs::write(
-            &path,
-            self.lines.join(
-                "
-",
-            ),
-        )?;
+        fs::write(&path, self.lines.join("\n"))?;
         self.modified = false;
         Ok(path)
     }

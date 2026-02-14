@@ -16,6 +16,7 @@ pub use language::{
     LspLanguage, all_languages, detect_language, detect_language_from_path_or_name,
 };
 pub use types::{
-    DiagnosticItem, DiagnosticSeverity, LspCompletionItem, LspEvent, LspSemanticToken,
-    LspServerCheckItem, LspServerCheckReport, LspTextEdit,
+    DiagnosticItem, DiagnosticSeverity, LspCodeAction, LspCommand, LspCompletionItem, LspEvent,
+    LspSemanticToken, LspServerCapabilities, LspServerCheckItem, LspServerCheckReport, LspTextEdit,
+    LspWorkspaceEdit, LspWorkspaceFileEdit,
 };

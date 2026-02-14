@@ -1,6 +1,5 @@
 use std::{
-    fs,
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -8,6 +7,8 @@ use std::{
 
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+
+use crate::encoding::append_utf8_json_line;
 
 /// 统一结构化日志事件（JSON Line）。
 ///
@@ -172,21 +173,21 @@ pub fn log_event(workspace_root: &Path, event: &AgentEvent) -> io::Result<()> {
     fs::create_dir_all(&dir)?;
 
     let path = daily_log_path(workspace_root);
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-
     let json =
         serde_json::to_string(event).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    file.write_all(json.as_bytes())?;
-    file.write_all(b"\n")?;
+    append_utf8_json_line(&path, &json)?;
     Ok(())
 }
 
-/// 尽力写日志：任何错误都会被吞掉。
+/// 尽力写日志：失败时只告警，不中断主流程。
 pub fn log_event_best_effort(workspace_root: &Path, event: AgentEvent) {
-    let _ = log_event(workspace_root, &event);
+    if let Err(error) = log_event(workspace_root, &event) {
+        let path = daily_log_path(workspace_root);
+        eprintln!(
+            "写入结构化日志失败（已忽略，不影响主流程）: {} ({error})",
+            path.display()
+        );
+    }
 }
 
 /// 便捷：构建带 `ts` 字段的事件时间戳。

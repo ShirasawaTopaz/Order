@@ -1,5 +1,6 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
+    fs,
     path::Path,
     path::PathBuf,
     time::{Duration, Instant},
@@ -7,8 +8,8 @@ use std::{
 
 use crossterm::event::{self, Event, KeyEventKind};
 use lsp::{
-    DiagnosticItem, LspClient, LspEvent, LspSemanticToken, LspTextEdit,
-    detect_language_from_path_or_name,
+    DiagnosticItem, LspClient, LspCodeAction, LspEvent, LspSemanticToken, LspTextEdit,
+    LspWorkspaceEdit, detect_language_from_path_or_name,
 };
 use ratatui::DefaultTerminal;
 
@@ -53,6 +54,11 @@ pub struct Editor {
     last_editor_inner_area: Option<ratatui::layout::Rect>,
     mode: EditorMode,
     normal_pending: String,
+    /// `RenameInput` 模式下的临时输入缓冲。
+    ///
+    /// 独立存储输入内容可以避免污染 NORMAL 命令串，
+    /// 同时为后续扩展“更多带参数的 LSP 命令”预留统一入口。
+    rename_input: String,
     insert_j_pending: bool,
     terminal_escape_pending: bool,
     buffers: Vec<EditorBuffer>,
@@ -70,6 +76,11 @@ pub struct Editor {
     theme: ThemeName,
     diagnostics: Vec<String>,
     diagnostic_index: usize,
+    /// 最近一次由 LSP 发布的诊断，按文件路径分组缓存。
+    ///
+    /// quick fix 请求需要把诊断上下文回传给服务端，
+    /// 因此不能只保留渲染后的字符串列表。
+    lsp_diagnostics_by_file: HashMap<PathBuf, Vec<DiagnosticItem>>,
     status_message: String,
     command_history: Vec<String>,
     /// 多语言 LSP 客户端。
@@ -119,6 +130,7 @@ impl Editor {
             last_editor_inner_area: None,
             mode: EditorMode::Normal,
             normal_pending: String::new(),
+            rename_input: String::new(),
             insert_j_pending: false,
             terminal_escape_pending: false,
             buffers: vec![buffer],
@@ -140,6 +152,7 @@ impl Editor {
                 "error: mismatched types".to_string(),
             ],
             diagnostic_index: 0,
+            lsp_diagnostics_by_file: HashMap::new(),
             status_message: lsp_start_message,
             command_history: Vec::new(),
             lsp_client,
@@ -252,11 +265,8 @@ impl Editor {
                 LspEvent::Status(text) => {
                     self.status_message = text;
                 }
-                LspEvent::PublishDiagnostics {
-                    file_path: _,
-                    items,
-                } => {
-                    self.apply_lsp_diagnostics(items);
+                LspEvent::PublishDiagnostics { file_path, items } => {
+                    self.apply_lsp_diagnostics(file_path, items);
                 }
                 LspEvent::WillSaveWaitUntilEdits { file_path, edits } => {
                     self.apply_will_save_wait_until_edits(&file_path, edits);
@@ -269,6 +279,49 @@ impl Editor {
                     self.apply_lsp_semantic_tokens(&file_path, tokens);
                     if token_count > 0 {
                         self.lsp_loading_status = "项目加载完成".to_string();
+                    }
+                }
+                LspEvent::FormattingEdits { file_path, edits } => {
+                    self.apply_formatting_edits(&file_path, edits);
+                }
+                LspEvent::RenameWorkspaceEdit {
+                    file_path,
+                    new_name,
+                    edit,
+                } => {
+                    self.apply_rename_workspace_edit(&file_path, &new_name, edit);
+                }
+                LspEvent::CodeActions { file_path, actions } => {
+                    self.apply_quick_fix_code_actions(&file_path, actions);
+                }
+                LspEvent::WorkspaceApplyEditRequest {
+                    language,
+                    request_id,
+                    label,
+                    edit,
+                } => {
+                    let summary = self.apply_workspace_edit(edit);
+                    let applied = summary.failed_files == 0;
+                    let failure_reason =
+                        (!applied).then(|| format!("{} 个文件应用失败", summary.failed_files));
+
+                    if let Err(error) = self.lsp_client.respond_workspace_apply_edit(
+                        language,
+                        request_id,
+                        applied,
+                        failure_reason.as_deref(),
+                    ) {
+                        self.status_message = format!("workspace/applyEdit 回包失败: {error}");
+                    } else if let Some(label) = label {
+                        self.status_message = format!(
+                            "workspace/applyEdit：{}（{} 文件，{} 编辑）",
+                            label, summary.touched_files, summary.applied_edits
+                        );
+                    } else {
+                        self.status_message = format!(
+                            "workspace/applyEdit：{} 文件，{} 编辑",
+                            summary.touched_files, summary.applied_edits
+                        );
                     }
                 }
                 LspEvent::RustAnalyzerStatus { message, done } => {
@@ -415,27 +468,47 @@ impl Editor {
         }
     }
 
-    /// 将 LSP 诊断列表映射到现有 diagnostics 面板。
-    fn apply_lsp_diagnostics(&mut self, items: Vec<DiagnosticItem>) {
-        let mut rendered = Vec::new();
-        for item in items {
-            let file = item
-                .file_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("<unknown>");
-            rendered.push(format!(
-                "{}:{}:{} [{}] {}",
-                file,
-                item.line,
-                item.column,
-                item.severity.as_str(),
-                item.message
-            ));
+    /// 将 LSP 诊断按文件缓存，并同步到 diagnostics 面板。
+    fn apply_lsp_diagnostics(&mut self, file_path: PathBuf, items: Vec<DiagnosticItem>) {
+        if items.is_empty() {
+            self.lsp_diagnostics_by_file.remove(&file_path);
+        } else {
+            self.lsp_diagnostics_by_file.insert(file_path, items);
         }
 
-        self.diagnostics = rendered;
-        self.diagnostic_index = 0;
+        let mut flattened = self
+            .lsp_diagnostics_by_file
+            .values()
+            .flat_map(|items| items.iter().cloned())
+            .collect::<Vec<_>>();
+        flattened.sort_by(|left, right| {
+            left.file_path
+                .cmp(&right.file_path)
+                .then(left.line.cmp(&right.line))
+                .then(left.column.cmp(&right.column))
+        });
+
+        self.diagnostics = flattened
+            .iter()
+            .map(|item| {
+                let file = item
+                    .file_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("<unknown>");
+                format!(
+                    "{}:{}:{} [{}] {}",
+                    file,
+                    item.line,
+                    item.column,
+                    item.severity.as_str(),
+                    item.message
+                )
+            })
+            .collect();
+        self.diagnostic_index = self
+            .diagnostic_index
+            .min(self.diagnostics.len().saturating_sub(1));
         if self.diagnostics.is_empty() {
             self.status_message = "LSP: 无诊断问题".to_string();
         } else {
@@ -443,63 +516,270 @@ impl Editor {
         }
     }
 
+    /// 应用 `textDocument/formatting` 返回的编辑。
+    fn apply_formatting_edits(&mut self, file_path: &Path, edits: Vec<LspTextEdit>) {
+        if edits.is_empty() {
+            self.status_message = "LSP format：无需要应用的编辑".to_string();
+            return;
+        }
+
+        match self.apply_text_edits_to_file(file_path, edits) {
+            Ok(applied_edits) => {
+                self.status_message = format!("LSP format：已应用 {} 条编辑", applied_edits);
+            }
+            Err(error) => {
+                self.status_message = format!("LSP format 应用失败：{error}");
+            }
+        }
+    }
+
+    /// 应用 `textDocument/rename` 返回的工作区编辑。
+    fn apply_rename_workspace_edit(
+        &mut self,
+        _file_path: &Path,
+        new_name: &str,
+        edit: Option<LspWorkspaceEdit>,
+    ) {
+        let Some(edit) = edit else {
+            self.status_message = format!("LSP rename：`{new_name}` 未返回可应用编辑");
+            return;
+        };
+
+        if edit.is_empty() {
+            self.status_message = format!("LSP rename：`{new_name}` 无需修改");
+            return;
+        }
+
+        let summary = self.apply_workspace_edit(edit);
+        if summary.failed_files == 0 {
+            self.status_message = format!(
+                "LSP rename：`{new_name}` 已完成（{} 文件，{} 编辑）",
+                summary.touched_files, summary.applied_edits
+            );
+        } else {
+            self.status_message = format!(
+                "LSP rename：部分失败（成功 {} 文件，失败 {} 文件）",
+                summary.touched_files, summary.failed_files
+            );
+        }
+    }
+
+    /// 选择并执行最合适的 quick fix。
+    fn apply_quick_fix_code_actions(&mut self, file_path: &Path, actions: Vec<LspCodeAction>) {
+        let Some(selected) = pick_preferred_quick_fix(actions) else {
+            self.status_message = "LSP quick fix：当前无可用修复".to_string();
+            return;
+        };
+
+        let mut status_parts = Vec::new();
+        if let Some(edit) = selected.edit.clone() {
+            let summary = self.apply_workspace_edit(edit);
+            if summary.failed_files == 0 {
+                status_parts.push(format!(
+                    "已应用 {} 文件 / {} 编辑",
+                    summary.touched_files, summary.applied_edits
+                ));
+            } else {
+                status_parts.push(format!(
+                    "应用部分失败（成功 {}，失败 {}）",
+                    summary.touched_files, summary.failed_files
+                ));
+            }
+        }
+
+        if let Some(command) = selected.command.as_ref() {
+            match self.lsp_client.execute_command(file_path, command) {
+                Ok(()) => {
+                    status_parts.push(format!("已触发命令 `{}`", command.title));
+                }
+                Err(error) => {
+                    status_parts.push(format!("命令触发失败：{error}"));
+                }
+            }
+        }
+
+        if status_parts.is_empty() {
+            self.status_message = format!("LSP quick fix：{}（无可应用内容）", selected.title);
+        } else {
+            self.status_message = format!(
+                "LSP quick fix：{}，{}",
+                selected.title,
+                status_parts.join("，")
+            );
+        }
+    }
+
     /// 将 `willSaveWaitUntil` 返回的 TextEdit 应用到目标缓冲区。
     fn apply_will_save_wait_until_edits(
         &mut self,
         file_path: &std::path::Path,
-        mut edits: Vec<LspTextEdit>,
+        edits: Vec<LspTextEdit>,
     ) {
         if edits.is_empty() {
             return;
         }
 
-        let Some(buffer_idx) = self
-            .buffers
-            .iter()
-            .position(|buffer| buffer.path.as_deref() == Some(file_path))
-        else {
-            return;
-        };
+        match self.apply_text_edits_to_file(file_path, edits) {
+            Ok(applied_count) => {
+                self.lsp_last_action = format!("willSaveWaitUntil({} edits)", applied_count);
+                self.status_message = format!("LSP: 已应用 {} 条 TextEdit", applied_count);
+            }
+            Err(error) => {
+                self.status_message = format!("LSP TextEdit 应用失败：{error}");
+            }
+        }
+    }
 
-        // 为避免前面编辑影响后面区间坐标，按起始位置从后向前应用。
-        edits.sort_by(|left, right| {
-            left.start_line
-                .cmp(&right.start_line)
-                .then(left.start_character.cmp(&right.start_character))
-        });
-        edits.reverse();
-        let applied_count = edits.len();
-
-        let mut text = self.buffers[buffer_idx].lines.join("\n");
-        for edit in edits {
-            let Some(start_byte) =
-                line_col_to_byte_index(&text, edit.start_line, edit.start_character)
-            else {
-                continue;
-            };
-            let Some(end_byte) = line_col_to_byte_index(&text, edit.end_line, edit.end_character)
-            else {
-                continue;
-            };
-            if start_byte > end_byte || end_byte > text.len() {
+    /// 应用 `WorkspaceEdit` 并汇总结果。
+    ///
+    /// rename/quick fix 可能跨多个文件，且部分文件并不在当前编辑器缓冲区打开。
+    /// 这里统一处理“已打开缓冲区 + 未打开落盘文件”两类目标，避免编辑半生效。
+    fn apply_workspace_edit(&mut self, edit: LspWorkspaceEdit) -> WorkspaceEditApplySummary {
+        let mut summary = WorkspaceEditApplySummary::default();
+        for file_edit in edit.document_edits {
+            if file_edit.edits.is_empty() {
                 continue;
             }
-            text.replace_range(start_byte..end_byte, &edit.new_text);
-        }
 
-        let mut new_lines: Vec<String> = text.split('\n').map(ToOwned::to_owned).collect();
-        if new_lines.is_empty() {
-            new_lines.push(String::new());
+            match self.apply_text_edits_to_file(&file_edit.file_path, file_edit.edits) {
+                Ok(applied) if applied > 0 => {
+                    summary.touched_files += 1;
+                    summary.applied_edits += applied;
+                }
+                Ok(_) => {
+                    summary.failed_files += 1;
+                }
+                Err(_) => {
+                    summary.failed_files += 1;
+                }
+            }
         }
-
-        let buffer = &mut self.buffers[buffer_idx];
-        buffer.lines = new_lines;
-        buffer.modified = true;
-        buffer.lsp_dirty = true;
-        buffer.ensure_cursor_in_bounds();
-        self.lsp_last_action = format!("willSaveWaitUntil({} edits)", applied_count);
-        self.status_message = format!("LSP: 已应用 {} 条 TextEdit", applied_count);
+        summary
     }
+
+    /// 获取指定文件当前可用于 quick fix 的诊断。
+    pub(super) fn diagnostics_for_file(&self, file_path: &Path) -> Vec<DiagnosticItem> {
+        if let Some(items) = self.lsp_diagnostics_by_file.get(file_path) {
+            return items.clone();
+        }
+
+        // 某些平台上路径大小写或符号链接可能导致键不命中，这里做一次温和兜底。
+        self.lsp_diagnostics_by_file
+            .iter()
+            .find(|(path, _)| {
+                *path == file_path || path.canonicalize().ok() == file_path.canonicalize().ok()
+            })
+            .map(|(_, items)| items.clone())
+            .unwrap_or_default()
+    }
+
+    /// 将 text edits 应用到打开中的 buffer 或磁盘文件。
+    fn apply_text_edits_to_file(
+        &mut self,
+        file_path: &Path,
+        edits: Vec<LspTextEdit>,
+    ) -> Result<usize, String> {
+        if edits.is_empty() {
+            return Ok(0);
+        }
+
+        if let Some(buffer_idx) = self.buffers.iter().position(|buffer| {
+            buffer.path.as_ref().is_some_and(|path| {
+                path == file_path || path.canonicalize().ok() == file_path.canonicalize().ok()
+            })
+        }) {
+            let original = self.buffers[buffer_idx].lines.join("\n");
+            let (updated, applied_count) = apply_text_edits_to_text(original, edits);
+            let mut new_lines: Vec<String> = updated.split('\n').map(ToOwned::to_owned).collect();
+            if new_lines.is_empty() {
+                new_lines.push(String::new());
+            }
+
+            let buffer = &mut self.buffers[buffer_idx];
+            buffer.lines = new_lines;
+            buffer.modified = true;
+            buffer.lsp_dirty = true;
+            buffer.ensure_cursor_in_bounds();
+            return Ok(applied_count);
+        }
+
+        // 文件未在当前 buffer 打开时，直接在磁盘落地，保证 rename/quick fix 全局一致生效。
+        let original =
+            fs::read_to_string(file_path).map_err(|error| format!("读取失败: {}", error))?;
+        let (updated, applied_count) = apply_text_edits_to_text(original, edits);
+        fs::write(file_path, updated).map_err(|error| format!("写入失败: {}", error))?;
+        Ok(applied_count)
+    }
+}
+
+/// 工作区编辑应用结果统计。
+#[derive(Default)]
+struct WorkspaceEditApplySummary {
+    touched_files: usize,
+    applied_edits: usize,
+    failed_files: usize,
+}
+
+/// 从 code action 列表中挑选最合适的 quick fix。
+///
+/// 优先级策略：
+/// 1. `kind=quickfix` 且 `isPreferred=true`
+/// 2. `kind=quickfix`
+/// 3. 任意首个 action（兜底）
+fn pick_preferred_quick_fix(actions: Vec<LspCodeAction>) -> Option<LspCodeAction> {
+    actions
+        .iter()
+        .position(|item| {
+            item.kind
+                .as_deref()
+                .is_some_and(|kind| kind.starts_with("quickfix"))
+                && item.is_preferred
+        })
+        .and_then(|idx| actions.get(idx).cloned())
+        .or_else(|| {
+            actions
+                .iter()
+                .position(|item| {
+                    item.kind
+                        .as_deref()
+                        .is_some_and(|kind| kind.starts_with("quickfix"))
+                })
+                .and_then(|idx| actions.get(idx).cloned())
+        })
+        .or_else(|| actions.into_iter().next())
+}
+
+/// 按 LSP 坐标把一组 text edits 应用到文本。
+///
+/// 按“从后向前”应用的原因是：前面的替换会改变后续偏移，
+/// 倒序可以保证所有 edit 坐标都基于原始文本解释。
+fn apply_text_edits_to_text(mut text: String, mut edits: Vec<LspTextEdit>) -> (String, usize) {
+    edits.sort_by(|left, right| {
+        left.start_line
+            .cmp(&right.start_line)
+            .then(left.start_character.cmp(&right.start_character))
+    });
+    edits.reverse();
+
+    let mut applied_count = 0usize;
+    for edit in edits {
+        let Some(start_byte) = line_col_to_byte_index(&text, edit.start_line, edit.start_character)
+        else {
+            continue;
+        };
+        let Some(end_byte) = line_col_to_byte_index(&text, edit.end_line, edit.end_character)
+        else {
+            continue;
+        };
+        if start_byte > end_byte || end_byte > text.len() {
+            continue;
+        }
+
+        text.replace_range(start_byte..end_byte, &edit.new_text);
+        applied_count += 1;
+    }
+
+    (text, applied_count)
 }
 
 /// 将 `(line, column)`（0-based，按字符计数）转换为字符串字节索引。

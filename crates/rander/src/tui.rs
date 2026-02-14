@@ -8,6 +8,7 @@ use anyhow::{Context, anyhow};
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use core::{
     commands::{EXIT, get_exit},
+    encoding::{read_utf8_text_with_report, write_utf8_text_with_report},
     model::{
         connection::{Connection, ModelStreamEvent, Provider},
         info::{get_current_model_info, get_current_model_info_from_config},
@@ -1116,8 +1117,14 @@ impl OrderTui<'_> {
         let mut content = serde_json::to_string_pretty(&value).context("序列化模型配置失败")?;
         content.push('\n');
 
-        fs::write(config_path, content)
-            .with_context(|| format!("写入模型配置失败: {}", config_path.display()))
+        let report = write_utf8_text_with_report(config_path, &content)
+            .with_context(|| format!("写入模型配置失败: {}", config_path.display()))?;
+        if report.has_warning() {
+            for warning in report.warnings_for(config_path) {
+                eprintln!("model config encoding warning: {warning}");
+            }
+        }
+        Ok(())
     }
 
     /// 计算模型配置文件路径：运行目录下的 `.order/model.json`。
@@ -1291,12 +1298,23 @@ impl OrderTui<'_> {
         Err(anyhow!("请求失败：已超过最大重试次数"))
     }
 
+    /// 判断错误是否属于“用户主动取消”。
+    ///
+    /// 这里同时兼容中英文关键字，原因是不同 provider / SDK 在取消场景的报错文案并不一致。
+    fn is_cancelled_completion_error(error: &str) -> bool {
+        let normalized = error.to_ascii_lowercase();
+        error.contains("请求已取消")
+            || normalized.contains("cancelled")
+            || normalized.contains("canceled")
+            || normalized.contains("cancel")
+    }
+
     /// 判断错误是否可重试（网络抖动、限流、网关瞬时故障等）。
     fn is_retryable_stream_error(error: &str) -> bool {
-        let normalized = error.to_ascii_lowercase();
-        if normalized.contains("请求已取消") || normalized.contains("cancel") {
+        if Self::is_cancelled_completion_error(error) {
             return false;
         }
+        let normalized = error.to_ascii_lowercase();
 
         [
             "timeout",
@@ -1431,10 +1449,14 @@ impl OrderTui<'_> {
                 }
 
                 if let Err(error) = self.persist_history() {
-                    eprintln!("failed to persist history: {error}");
+                    let warning = format!("历史写入失败（请检查文件编码）: {error}");
+                    eprintln!("{warning}");
+                    self.push_chat_message(ChatRole::Error, warning, false);
                 }
                 if let Err(error) = self.persist_context_memory() {
-                    eprintln!("failed to persist context memory: {error}");
+                    let warning = format!("上下文记忆写入失败（请检查文件编码）: {error}");
+                    eprintln!("{warning}");
+                    self.push_chat_message(ChatRole::Error, warning, false);
                 }
 
                 log_event_best_effort(
@@ -1450,7 +1472,7 @@ impl OrderTui<'_> {
                 self.last_failure = None;
             }
             Err(error_message) => {
-                let cancelled = error_message.contains("请求已取消");
+                let cancelled = Self::is_cancelled_completion_error(&error_message);
                 if cancelled {
                     // 取消场景直接移除当前轮次，确保不会污染后续上下文与历史。
                     self.discard_pending_turn(
@@ -1602,13 +1624,17 @@ impl OrderTui<'_> {
         }
 
         // 消息入队后立即尝试持久化到运行目录。
-        // 历史/长期记忆写入失败都不影响主流程，仅通过标准错误输出告警。
+        // 失败时会同步回显到对话区，避免“写盘失败但界面无感知”的静默问题。
         if persist_to_history {
             if let Err(error) = self.persist_history() {
-                eprintln!("failed to persist history: {error}");
+                let warning = format!("历史写入失败（请检查文件编码）: {error}");
+                eprintln!("{warning}");
+                self.push_chat_message(ChatRole::Error, warning, false);
             }
             if let Err(error) = self.persist_context_memory() {
-                eprintln!("failed to persist context memory: {error}");
+                let warning = format!("上下文记忆写入失败（请检查文件编码）: {error}");
+                eprintln!("{warning}");
+                self.push_chat_message(ChatRole::Error, warning, false);
             }
         }
         Some(index)
@@ -1676,8 +1702,14 @@ impl OrderTui<'_> {
             return Ok(HistoryFile::default());
         }
 
-        let content = fs::read_to_string(path)
+        let (content, report) = read_utf8_text_with_report(path)
             .with_context(|| format!("读取历史文件失败: {}", path.display()))?;
+        if report.has_warning() {
+            for warning in report.warnings_for(path) {
+                // 历史文件由多处入口读取，统一使用标准错误输出提示编码修复信息。
+                eprintln!("history encoding warning: {warning}");
+            }
+        }
 
         if content.trim().is_empty() {
             return Ok(HistoryFile::default());
@@ -1690,8 +1722,17 @@ impl OrderTui<'_> {
 
     /// 将历史结构以 UTF-8 JSON（pretty）写回磁盘。
     fn write_history_file(path: &PathBuf, file: &HistoryFile) -> anyhow::Result<()> {
-        let content = serde_json::to_string_pretty(&file.records).context("序列化历史记录失败")?;
-        fs::write(path, content).with_context(|| format!("写入历史文件失败: {}", path.display()))
+        let mut content =
+            serde_json::to_string_pretty(&file.records).context("序列化历史记录失败")?;
+        content.push('\n');
+        let report = write_utf8_text_with_report(path, &content)
+            .with_context(|| format!("写入历史文件失败: {}", path.display()))?;
+        if report.has_warning() {
+            for warning in report.warnings_for(path) {
+                eprintln!("history encoding warning: {warning}");
+            }
+        }
+        Ok(())
     }
 
     /// 获取用于历史记录的模型名。
@@ -2110,19 +2151,30 @@ impl OrderTui<'_> {
         let mut success: u64 = 0;
         let mut sum_duration_ms: u128 = 0;
         let mut retry: u64 = 0;
+        let mut malformed_lines: u64 = 0;
 
         for path in candidates {
             if !path.exists() {
                 continue;
             }
-            let content = fs::read_to_string(&path)
+            let (content, report) = read_utf8_text_with_report(&path)
                 .with_context(|| format!("读取日志失败: {}", path.display()))?;
+            if report.has_warning() {
+                for warning in report.warnings_for(&path) {
+                    self.push_chat_message(
+                        ChatRole::Error,
+                        format!("日志编码提醒：{warning}"),
+                        false,
+                    );
+                }
+            }
             for line in content.lines() {
                 let text = line.trim();
                 if text.is_empty() {
                     continue;
                 }
                 let Ok(event) = serde_json::from_str::<AgentEvent>(text) else {
+                    malformed_lines += 1;
                     continue;
                 };
                 let AgentEvent::RequestEnd {
@@ -2137,6 +2189,7 @@ impl OrderTui<'_> {
                 };
 
                 let Ok(parsed) = DateTime::parse_from_rfc3339(&ts) else {
+                    malformed_lines += 1;
                     continue;
                 };
                 let event_time = parsed.with_timezone(&Utc);
@@ -2153,6 +2206,17 @@ impl OrderTui<'_> {
                     retry += 1;
                 }
             }
+        }
+
+        if malformed_lines > 0 {
+            self.push_chat_message(
+                ChatRole::Error,
+                format!(
+                    "日志自检提醒：检测到 {} 行无法解析的事件，请确认日志文件编码为 UTF-8 + LF。",
+                    malformed_lines
+                ),
+                false,
+            );
         }
 
         if total == 0 {
@@ -2285,6 +2349,64 @@ mod tests {
         );
         assert_eq!(history.get(1), Some(&RigMessage::user("u70")));
         assert_eq!(history.last(), Some(&RigMessage::assistant("a129")));
+    }
+
+    #[test]
+    fn discard_pending_turn_should_remove_transient_round() {
+        let mut tui = OrderTui::default();
+        tui.messages
+            .push(chat_message(ChatRole::User, "临时提问", false));
+        tui.messages
+            .push(chat_message(ChatRole::Llm, "正在生成...", false));
+        tui.messages
+            .push(chat_message(ChatRole::User, "保留消息", true));
+
+        // 取消后必须只删除当前未完成轮次，避免污染后续会话。
+        tui.discard_pending_turn(0, 1);
+
+        assert_eq!(tui.messages.len(), 1);
+        assert!(matches!(tui.messages[0].role, ChatRole::User));
+        assert_eq!(tui.messages[0].content, "保留消息");
+    }
+
+    #[test]
+    fn is_cancelled_completion_error_should_match_multi_language() {
+        assert!(OrderTui::is_cancelled_completion_error("请求已取消"));
+        assert!(OrderTui::is_cancelled_completion_error(
+            "request canceled by user"
+        ));
+        assert!(OrderTui::is_cancelled_completion_error(
+            "operation cancelled"
+        ));
+        assert!(!OrderTui::is_cancelled_completion_error("gateway timeout"));
+    }
+
+    #[test]
+    fn is_retryable_stream_error_should_reject_cancel_and_allow_network_errors() {
+        // 用户主动取消不应重试，否则会出现“取消后又自动重发”的违背预期行为。
+        assert!(!OrderTui::is_retryable_stream_error(
+            "request canceled by user"
+        ));
+        assert!(!OrderTui::is_retryable_stream_error("请求已取消"));
+        assert!(OrderTui::is_retryable_stream_error(
+            "503 Service Unavailable"
+        ));
+        assert!(OrderTui::is_retryable_stream_error(
+            "transport error: connection reset by peer"
+        ));
+        assert!(!OrderTui::is_retryable_stream_error("401 unauthorized"));
+    }
+
+    #[test]
+    fn retry_backoff_with_jitter_should_stay_in_expected_range() {
+        let attempt1 = OrderTui::retry_backoff_with_jitter(1).as_millis();
+        let attempt2 = OrderTui::retry_backoff_with_jitter(2).as_millis();
+        let attempt3 = OrderTui::retry_backoff_with_jitter(3).as_millis();
+
+        // 采用 base=600ms，jitter 上界约为 backoff 的 1/3。
+        assert!((600..=800).contains(&attempt1));
+        assert!((1200..=1600).contains(&attempt2));
+        assert!((2400..=3200).contains(&attempt3));
     }
 }
 

@@ -59,6 +59,7 @@ impl Editor {
             EditorMode::Visual => self.handle_visual_key_event(key),
             EditorMode::Terminal => self.handle_terminal_key_event(key),
             EditorMode::BufferPicker => self.handle_buffer_picker_key_event(key),
+            EditorMode::RenameInput => self.handle_rename_input_key_event(key),
         }
     }
 
@@ -430,6 +431,30 @@ impl Editor {
         }
     }
 
+    /// 处理 LSP rename 输入模式按键。
+    ///
+    /// 采用轻量输入模型（字符/退格/确认/取消）即可覆盖 MVP，
+    /// 避免在当前阶段引入完整命令行编辑器带来的复杂状态机。
+    pub(super) fn handle_rename_input_key_event(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = EditorMode::Normal;
+                self.rename_input.clear();
+                self.status_message = "已取消 LSP rename".to_string();
+            }
+            KeyCode::Enter => {
+                self.submit_lsp_rename();
+            }
+            KeyCode::Backspace => {
+                self.rename_input.pop();
+            }
+            KeyCode::Char(ch) => {
+                self.rename_input.push(ch);
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn handle_mouse_event(&mut self, mouse: MouseEvent) {
         let Some(area) = self.last_area else {
             return;
@@ -737,6 +762,18 @@ impl Editor {
                 self.run_lsp_server_check();
                 true
             }
+            "lr" => {
+                self.start_lsp_rename_input();
+                true
+            }
+            "lf" => {
+                self.request_lsp_format_for_active_buffer();
+                true
+            }
+            "lq" => {
+                self.request_lsp_quick_fix_for_active_buffer();
+                true
+            }
             "fb" => {
                 self.theme = self.theme.next();
                 self.status_message = format!("theme => {}", self.theme.as_str());
@@ -999,6 +1036,147 @@ impl Editor {
             .request_completion(&path, cursor_row, cursor_col)
         {
             self.status_message = format!("LSP completion 请求失败: {error}");
+        }
+    }
+
+    /// 进入 LSP rename 输入模式。
+    fn start_lsp_rename_input(&mut self) {
+        let buffer_idx = self.tabs[self.active_tab].buffer_index;
+        let Some(path) = self
+            .buffers
+            .get(buffer_idx)
+            .and_then(|buffer| buffer.path.clone())
+        else {
+            self.status_message = "LSP rename 仅支持已保存文件".to_string();
+            return;
+        };
+
+        if let Err(error) = self.lsp_client.ensure_started_for_file(&self.root, &path) {
+            self.status_message = format!("LSP 启动失败: {error}");
+            return;
+        }
+
+        let default_symbol = self.buffers[buffer_idx]
+            .word_at_cursor()
+            .map(|(_, _, text)| text)
+            .unwrap_or_default();
+        self.rename_input = default_symbol;
+        self.mode = EditorMode::RenameInput;
+        self.status_message = "LSP rename：输入新名称并回车确认，Esc 取消".to_string();
+    }
+
+    /// 提交当前 rename 输入。
+    fn submit_lsp_rename(&mut self) {
+        let new_name = self.rename_input.trim().to_string();
+        self.rename_input.clear();
+        self.mode = EditorMode::Normal;
+
+        if new_name.is_empty() {
+            self.status_message = "LSP rename 失败：新名称不能为空".to_string();
+            return;
+        }
+
+        let buffer_idx = self.tabs[self.active_tab].buffer_index;
+        let Some(path) = self
+            .buffers
+            .get(buffer_idx)
+            .and_then(|buffer| buffer.path.clone())
+        else {
+            self.status_message = "LSP rename 仅支持已保存文件".to_string();
+            return;
+        };
+        let cursor_row = self.buffers[buffer_idx].cursor_row;
+        let cursor_col = self.buffers[buffer_idx].cursor_col;
+
+        if let Err(error) = self.lsp_client.ensure_started_for_file(&self.root, &path) {
+            self.status_message = format!("LSP 启动失败: {error}");
+            return;
+        }
+
+        match self
+            .lsp_client
+            .request_rename(&path, cursor_row, cursor_col, &new_name)
+        {
+            Ok(()) => {
+                self.status_message = format!("LSP rename 请求已发送：{}", new_name);
+            }
+            Err(error) => {
+                self.status_message = format!("LSP rename 请求失败: {error}");
+            }
+        }
+    }
+
+    /// 对当前文件请求 LSP 格式化。
+    fn request_lsp_format_for_active_buffer(&mut self) {
+        let buffer_idx = self.tabs[self.active_tab].buffer_index;
+        let Some(path) = self
+            .buffers
+            .get(buffer_idx)
+            .and_then(|buffer| buffer.path.clone())
+        else {
+            self.status_message = "LSP format 仅支持已保存文件".to_string();
+            return;
+        };
+
+        if let Err(error) = self.lsp_client.ensure_started_for_file(&self.root, &path) {
+            self.status_message = format!("LSP 启动失败: {error}");
+            return;
+        }
+
+        match self.lsp_client.request_formatting(&path, 4, true) {
+            Ok(()) => {
+                self.status_message = "LSP format 请求已发送".to_string();
+            }
+            Err(error) => {
+                self.status_message = format!("LSP format 请求失败: {error}");
+            }
+        }
+    }
+
+    /// 对当前光标请求 quick fix。
+    fn request_lsp_quick_fix_for_active_buffer(&mut self) {
+        let buffer_idx = self.tabs[self.active_tab].buffer_index;
+        let Some(path) = self
+            .buffers
+            .get(buffer_idx)
+            .and_then(|buffer| buffer.path.clone())
+        else {
+            self.status_message = "LSP quick fix 仅支持已保存文件".to_string();
+            return;
+        };
+        let cursor_row = self.buffers[buffer_idx].cursor_row;
+        let cursor_col = self.buffers[buffer_idx].cursor_col;
+
+        if let Err(error) = self.lsp_client.ensure_started_for_file(&self.root, &path) {
+            self.status_message = format!("LSP 启动失败: {error}");
+            return;
+        }
+
+        let all_diagnostics = self.diagnostics_for_file(&path);
+        // 优先传入“光标行相关诊断”，可提升 quick fix 命中率；若为空再回退全量。
+        let scoped_diagnostics = all_diagnostics
+            .iter()
+            .filter(|item| item.lsp_start_line <= cursor_row && item.lsp_end_line >= cursor_row)
+            .cloned()
+            .collect::<Vec<_>>();
+        let request_diagnostics = if scoped_diagnostics.is_empty() {
+            all_diagnostics
+        } else {
+            scoped_diagnostics
+        };
+
+        match self.lsp_client.request_code_actions(
+            &path,
+            cursor_row,
+            cursor_col,
+            &request_diagnostics,
+        ) {
+            Ok(()) => {
+                self.status_message = "LSP quick fix 请求已发送".to_string();
+            }
+            Err(error) => {
+                self.status_message = format!("LSP quick fix 请求失败: {error}");
+            }
         }
     }
 

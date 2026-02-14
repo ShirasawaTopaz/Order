@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+use crate::encoding::{read_utf8_text_with_report, write_utf8_text_with_report};
 use crate::observability::{AgentEvent, log_event_best_effort, ts, workspace_root_best_effort};
 
 /// 自动验证配置（可选），读取自 `.order/validation.toml`。
@@ -165,8 +166,13 @@ fn load_validation_config(workspace_root: &Path) -> Result<ValidationConfig> {
     if !path.exists() {
         return Ok(ValidationConfig::default());
     }
-    let text = fs::read_to_string(&path)
+    let (text, report) = read_utf8_text_with_report(&path)
         .with_context(|| format!("读取验证配置失败: {}", path.display()))?;
+    if report.has_warning() {
+        for warning in report.warnings_for(&path) {
+            eprintln!("validation config encoding warning: {warning}");
+        }
+    }
     if text.trim().is_empty() {
         return Ok(ValidationConfig::default());
     }
@@ -319,5 +325,12 @@ fn write_report(workspace_root: &Path, trace_id: &str, report: &ValidationReport
     let path = dir.join("validation.json");
     let mut text = serde_json::to_string_pretty(report).context("序列化验证报告失败")?;
     text.push('\n');
-    fs::write(&path, text).with_context(|| format!("写入验证报告失败: {}", path.display()))
+    let report = write_utf8_text_with_report(&path, &text)
+        .with_context(|| format!("写入验证报告失败: {}", path.display()))?;
+    if report.has_warning() {
+        for warning in report.warnings_for(&path) {
+            eprintln!("validation report encoding warning: {warning}");
+        }
+    }
+    Ok(())
 }

@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod encoding;
 pub mod model;
 pub mod observability;
 pub mod safety;

@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 
+use crate::encoding::{read_utf8_text_with_report, write_utf8_text_with_report};
+
 use super::connection::Provider;
 
 /// 模型端点类型（用于区分 responses API 与 chat/completions API）。
@@ -345,8 +347,13 @@ fn load_cache_file(workspace_root: &Path) -> Result<CapabilityCacheFile> {
         });
     }
 
-    let text = fs::read_to_string(&path)
+    let (text, report) = read_utf8_text_with_report(&path)
         .with_context(|| format!("读取能力缓存失败: {}", path.display()))?;
+    if report.has_warning() {
+        for warning in report.warnings_for(&path) {
+            eprintln!("capability cache encoding warning: {warning}");
+        }
+    }
     if text.trim().is_empty() {
         return Ok(CapabilityCacheFile {
             version: 1,
@@ -369,5 +376,12 @@ fn save_cache_file(workspace_root: &Path, cache: &CapabilityCacheFile) -> Result
     // 统一以 pretty JSON + 尾随换行写入，便于手动查看与减少 diff 噪音。
     let mut text = serde_json::to_string_pretty(cache).context("序列化能力缓存 JSON 失败")?;
     text.push('\n');
-    fs::write(&path, text).with_context(|| format!("写入能力缓存失败: {}", path.display()))
+    let report = write_utf8_text_with_report(&path, &text)
+        .with_context(|| format!("写入能力缓存失败: {}", path.display()))?;
+    if report.has_warning() {
+        for warning in report.warnings_for(&path) {
+            eprintln!("capability cache encoding warning: {warning}");
+        }
+    }
+    Ok(())
 }

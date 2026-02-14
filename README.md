@@ -17,6 +17,15 @@
 - Cargo
 - 支持 ANSI/鼠标事件的终端（Windows Terminal、PowerShell、WezTerm 等）
 
+## Windows 编码兼容
+
+- 程序启动时会自动检测并将 Windows 控制台输入/输出编码切换为 UTF-8（code page `65001`）。
+- 历史、日志、模型配置等文本文件统一按 UTF-8（无 BOM）+ LF 读写；检测到 BOM/CRLF 时会给出提示并做兼容处理。
+- 若终端仍出现中文乱码，可优先检查以下项：
+  - PowerShell：在配置文件中设置 `[Console]::InputEncoding=[Text.UTF8Encoding]::UTF8` 与 `[Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8`。
+  - Windows Terminal：使用支持中文的等宽字体（如 `Cascadia Mono PL`、`Sarasa Mono SC`）。
+  - 环境变量：若手动设置 `LANG`/`LC_ALL`，确保值包含 `UTF-8`。
+
 ## 快速开始
 
 在仓库根目录执行：
@@ -51,6 +60,7 @@ cargo check --workspace
 - 正常发送消息后，响应会以增量方式实时渲染到对话区。
 - 请求进行中可用 `/cancel` 中断；此时 `Ctrl+C` 也会执行“取消请求”，而不是直接退出程序。
 - 当没有进行中的请求时，`Ctrl+C` 仍按原行为退出程序。
+- 流式请求默认带有超时与自动重试（指数退避 + 抖动），仅在“未产出正文增量且判定为可重试错误”时触发，避免重复输出污染会话。
 
 ## 对话上下文
 
@@ -109,7 +119,7 @@ cargo check --workspace
 
 ## LSP 能力说明
 
-编辑器当前支持以下语言的 LSP 诊断、补全与语义高亮：
+编辑器当前支持以下语言的 LSP 诊断、补全、语义高亮，以及基础编辑工作流（rename / format / quick fix）：
 
 - Rust（`rust-analyzer`）
 - Python（`pylsp`）
@@ -126,6 +136,8 @@ cargo check --workspace
 - 语言服务器采用“按需启动”，在首次打开对应语言文件时自动拉起。
 - Rust 代码高亮已切换为由 `rust-analyzer` 返回的语义 token 驱动。
 - 代码补全由 LSP 异步返回并在编辑器中缓存，并以光标附近的 popover 浮层展示。
+- rename 支持弹窗输入新符号名并通过 `textDocument/rename` 触发跨文件编辑。
+- quick fix 支持 `textDocument/codeAction` + `workspace/applyEdit` 闭环，优先执行 `quickfix` 动作。
 
 ## editor 快捷键
 
@@ -168,6 +180,12 @@ cargo check --workspace
 - `a` 到 `z`：按字母选择缓冲区
 - `Esc`：取消选择并返回 `NORMAL`
 
+### RENAME INPUT 模式
+
+- `Enter`：确认并发送 `textDocument/rename`
+- `Backspace`：删除输入
+- `Esc`：取消并返回 `NORMAL`
+
 ### NORMAL 命令（直接输入，无需冒号）
 
 | 命令 | 说明 |
@@ -198,6 +216,9 @@ cargo check --workspace
 | `fh` | 在状态栏展示命令历史 |
 | `fc` | 强制回到 `NORMAL` 模式 |
 | `lc` | 执行 LSP 服务器可用性检查（PATH 中是否可用） |
+| `lr` | 打开 LSP rename 输入框（Enter 确认，Esc 取消） |
+| `lf` | 对当前文件发送 LSP format 请求 |
+| `lq` | 对当前光标发送 LSP quick fix 请求 |
 | `[g` | 跳到上一条诊断 |
 | `]g` | 跳到下一条诊断 |
 | `K` | 显示当前诊断详情 |

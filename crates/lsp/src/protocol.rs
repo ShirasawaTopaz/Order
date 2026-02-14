@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::ChildStdin,
@@ -8,7 +9,8 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::types::{
-    DiagnosticItem, DiagnosticSeverity, LspCompletionItem, LspSemanticToken, LspTextEdit,
+    DiagnosticItem, DiagnosticSeverity, LspCodeAction, LspCommand, LspCompletionItem,
+    LspSemanticToken, LspServerCapabilities, LspTextEdit, LspWorkspaceEdit, LspWorkspaceFileEdit,
 };
 
 /// 从 LSP 输出流读取下一条 JSON-RPC 消息。
@@ -103,16 +105,44 @@ pub fn parse_publish_diagnostics(value: &Value) -> (Option<PathBuf>, Vec<Diagnos
         let start = range
             .and_then(|map| map.get("start"))
             .and_then(Value::as_object);
+        let end = range
+            .and_then(|map| map.get("end"))
+            .and_then(Value::as_object);
+        let lsp_start_line = start
+            .and_then(|map| map.get("line"))
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0);
+        let lsp_start_character = start
+            .and_then(|map| map.get("character"))
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0);
+        let lsp_end_line = end
+            .and_then(|map| map.get("line"))
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(lsp_start_line);
+        let lsp_end_character = end
+            .and_then(|map| map.get("character"))
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(lsp_start_character);
         let line = start
             .and_then(|map| map.get("line"))
             .and_then(Value::as_u64)
-            .unwrap_or(0)
+            .unwrap_or_else(|| u64::try_from(lsp_start_line).unwrap_or(0))
             .saturating_add(1);
         let column = start
             .and_then(|map| map.get("character"))
             .and_then(Value::as_u64)
-            .unwrap_or(0)
+            .unwrap_or_else(|| u64::try_from(lsp_start_character).unwrap_or(0))
             .saturating_add(1);
+        let source = diagnostic
+            .get("source")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let code = parse_diagnostic_code(diagnostic.get("code"));
 
         let file_path = file_path
             .clone()
@@ -123,10 +153,28 @@ pub fn parse_publish_diagnostics(value: &Value) -> (Option<PathBuf>, Vec<Diagnos
             column,
             severity,
             message,
+            lsp_start_line,
+            lsp_start_character,
+            lsp_end_line,
+            lsp_end_character,
+            source,
+            code,
         });
     }
 
     (file_path, items)
+}
+
+/// 归一化诊断 code 字段。
+///
+/// 部分服务端返回数字，部分返回字符串，这里统一转为字符串，
+/// 避免上层逻辑为了兼容类型分支而增加额外复杂度。
+fn parse_diagnostic_code(raw: Option<&Value>) -> Option<String> {
+    let raw = raw?;
+    if let Some(code) = raw.as_str() {
+        return Some(code.to_string());
+    }
+    raw.as_i64().map(|code| code.to_string())
 }
 
 /// 解析 `textDocument/completion` 响应。
@@ -298,12 +346,198 @@ pub fn parse_semantic_legend_from_initialize_response(
     Some((token_types, token_modifiers))
 }
 
+/// 从 `initialize` 响应中解析服务端能力。
+pub fn parse_server_capabilities_from_initialize_response(
+    value: &Value,
+) -> Option<LspServerCapabilities> {
+    let capabilities = value
+        .get("result")
+        .and_then(Value::as_object)
+        .and_then(|result| result.get("capabilities"))
+        .and_then(Value::as_object)?;
+
+    Some(LspServerCapabilities {
+        rename: is_capability_enabled(capabilities.get("renameProvider")),
+        code_action: is_capability_enabled(capabilities.get("codeActionProvider")),
+        formatting: is_capability_enabled(capabilities.get("documentFormattingProvider")),
+        execute_command: capabilities
+            .get("executeCommandProvider")
+            .and_then(Value::as_object)
+            .is_some(),
+    })
+}
+
+/// 统一处理「能力可能是 bool 或 object」的 LSP 字段。
+fn is_capability_enabled(value: Option<&Value>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    match value {
+        Value::Bool(enabled) => *enabled,
+        Value::Object(_) => true,
+        _ => false,
+    }
+}
+
 /// 解析 `textDocument/willSaveWaitUntil` 响应中的 text edits。
 pub fn parse_text_edits_from_response(value: &Value) -> Vec<LspTextEdit> {
     let Some(items) = value.get("result").and_then(Value::as_array) else {
         return Vec::new();
     };
+    parse_text_edits_from_items(items)
+}
 
+/// 解析 `textDocument/rename` 响应中的 `WorkspaceEdit`。
+pub fn parse_workspace_edit_from_response(value: &Value) -> Option<LspWorkspaceEdit> {
+    parse_workspace_edit_from_value(value.get("result")?)
+}
+
+/// 解析任意 `WorkspaceEdit` 对象。
+///
+/// LSP 中同一个 `WorkspaceEdit` 可能使用 `changes` 或 `documentChanges` 两种结构，
+/// 这里统一归一化为“按文件分组的 TextEdit”，方便 UI 层直接应用。
+pub fn parse_workspace_edit_from_value(value: &Value) -> Option<LspWorkspaceEdit> {
+    let object = value.as_object()?;
+    let mut grouped_edits: BTreeMap<PathBuf, Vec<LspTextEdit>> = BTreeMap::new();
+
+    if let Some(changes) = object.get("changes").and_then(Value::as_object) {
+        for (uri, edits_value) in changes {
+            let Some(file_path) = file_uri_to_path(uri) else {
+                continue;
+            };
+            let Some(edits) = edits_value.as_array() else {
+                continue;
+            };
+            let parsed = parse_text_edits_from_items(edits);
+            if parsed.is_empty() {
+                continue;
+            }
+            grouped_edits.entry(file_path).or_default().extend(parsed);
+        }
+    }
+
+    if let Some(document_changes) = object.get("documentChanges").and_then(Value::as_array) {
+        for change in document_changes {
+            let Some(change_object) = change.as_object() else {
+                continue;
+            };
+            let Some(text_document) = change_object.get("textDocument").and_then(Value::as_object)
+            else {
+                // 资源操作（create/rename/delete）先跳过，避免误改文件系统。
+                continue;
+            };
+            let Some(uri) = text_document.get("uri").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(file_path) = file_uri_to_path(uri) else {
+                continue;
+            };
+            let Some(edits) = change_object.get("edits").and_then(Value::as_array) else {
+                continue;
+            };
+            let parsed = parse_text_edits_from_items(edits);
+            if parsed.is_empty() {
+                continue;
+            }
+            grouped_edits.entry(file_path).or_default().extend(parsed);
+        }
+    }
+
+    let document_edits = grouped_edits
+        .into_iter()
+        .map(|(file_path, edits)| LspWorkspaceFileEdit { file_path, edits })
+        .collect::<Vec<_>>();
+
+    Some(LspWorkspaceEdit { document_edits })
+}
+
+/// 解析 `textDocument/codeAction` 响应。
+pub fn parse_code_actions_from_response(value: &Value) -> Vec<LspCodeAction> {
+    let Some(items) = value.get("result").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut actions = Vec::new();
+    for item in items {
+        // 兼容 `(Command | CodeAction)[]` 返回格式。
+        if let Some(command) = parse_command_from_value(item) {
+            if item.get("edit").is_none() && item.get("kind").is_none() {
+                actions.push(LspCodeAction {
+                    title: command.title.clone(),
+                    kind: None,
+                    is_preferred: false,
+                    edit: None,
+                    command: Some(command),
+                });
+                continue;
+            }
+        }
+
+        let title = item
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if title.is_empty() {
+            continue;
+        }
+
+        let kind = item
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let is_preferred = item
+            .get("isPreferred")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let edit = item.get("edit").and_then(parse_workspace_edit_from_value);
+        let command = item.get("command").and_then(parse_command_from_value);
+
+        actions.push(LspCodeAction {
+            title,
+            kind,
+            is_preferred,
+            edit,
+            command,
+        });
+    }
+
+    actions
+}
+
+/// 判断消息是否为服务端发起的 `workspace/applyEdit` 请求。
+pub fn is_workspace_apply_edit_request(value: &Value) -> bool {
+    value
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(|method| method == "workspace/applyEdit")
+        && response_request_id(value).is_some()
+}
+
+/// 解析服务端 `workspace/applyEdit` 请求。
+pub fn parse_workspace_apply_edit_request(
+    value: &Value,
+) -> Option<(u64, Option<String>, LspWorkspaceEdit)> {
+    if !is_workspace_apply_edit_request(value) {
+        return None;
+    }
+
+    let request_id = response_request_id(value)?;
+    let params = value.get("params").and_then(Value::as_object)?;
+    let label = params
+        .get("label")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let edit = params
+        .get("edit")
+        .and_then(parse_workspace_edit_from_value)
+        .unwrap_or_default();
+
+    Some((request_id, label, edit))
+}
+
+/// 解析 `WorkspaceEdit` / `TextDocumentEdit` 中的 `TextEdit[]`。
+fn parse_text_edits_from_items(items: &[Value]) -> Vec<LspTextEdit> {
     let mut edits = Vec::new();
     for item in items {
         let range = item.get("range").and_then(Value::as_object);
@@ -328,12 +562,12 @@ pub fn parse_text_edits_from_response(value: &Value) -> Vec<LspTextEdit> {
             .and_then(|map| map.get("line"))
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(0);
+            .unwrap_or(start_line);
         let end_character = end
             .and_then(|map| map.get("character"))
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(0);
+            .unwrap_or(start_character);
         let new_text = item
             .get("newText")
             .and_then(Value::as_str)
@@ -348,8 +582,28 @@ pub fn parse_text_edits_from_response(value: &Value) -> Vec<LspTextEdit> {
             new_text,
         });
     }
-
     edits
+}
+
+/// 解析 `Command` 对象。
+fn parse_command_from_value(value: &Value) -> Option<LspCommand> {
+    let object = value.as_object()?;
+    let command = object.get("command").and_then(Value::as_str)?.to_string();
+    let title = object
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or(command.as_str())
+        .to_string();
+    let arguments = object
+        .get("arguments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Some(LspCommand {
+        title,
+        command,
+        arguments,
+    })
 }
 
 /// 将本地路径转换为 `file://` URI。
@@ -591,4 +845,131 @@ pub fn parse_rust_analyzer_progress(value: &Value) -> Option<(String, bool)> {
     };
 
     Some((normalized, kind == "end"))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        is_workspace_apply_edit_request, parse_code_actions_from_response,
+        parse_server_capabilities_from_initialize_response, parse_workspace_apply_edit_request,
+        parse_workspace_edit_from_value,
+    };
+
+    #[test]
+    fn workspace_edit_should_parse_changes() {
+        let value = json!({
+            "changes": {
+                "file:///tmp/main.rs": [
+                    {
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 3}
+                        },
+                        "newText": "abc"
+                    }
+                ]
+            }
+        });
+
+        let parsed = parse_workspace_edit_from_value(&value).expect("workspace edit 应可解析");
+        assert_eq!(parsed.document_edits.len(), 1);
+        assert_eq!(parsed.document_edits[0].edits.len(), 1);
+        assert_eq!(parsed.document_edits[0].edits[0].new_text, "abc");
+    }
+
+    #[test]
+    fn code_action_should_support_command_and_edit_variants() {
+        let response = json!({
+            "result": [
+                {
+                    "title": "run command",
+                    "command": "rust-analyzer.applySourceChange",
+                    "arguments": []
+                },
+                {
+                    "title": "fix typo",
+                    "kind": "quickfix",
+                    "isPreferred": true,
+                    "edit": {
+                        "changes": {
+                            "file:///tmp/main.rs": [
+                                {
+                                    "range": {
+                                        "start": {"line": 1, "character": 0},
+                                        "end": {"line": 1, "character": 1}
+                                    },
+                                    "newText": "x"
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        });
+
+        let actions = parse_code_actions_from_response(&response);
+        assert_eq!(actions.len(), 2);
+        assert!(actions[0].command.is_some());
+        assert!(actions[1].edit.is_some());
+        assert!(actions[1].is_preferred);
+    }
+
+    #[test]
+    fn workspace_apply_edit_request_should_parse() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "workspace/applyEdit",
+            "params": {
+                "label": "quick fix",
+                "edit": {
+                    "changes": {
+                        "file:///tmp/main.rs": [
+                            {
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 0}
+                                },
+                                "newText": "let a = 1;\n"
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+
+        assert!(is_workspace_apply_edit_request(&request));
+        let (request_id, label, edit) =
+            parse_workspace_apply_edit_request(&request).expect("workspace/applyEdit 请求应可解析");
+        assert_eq!(request_id, 7);
+        assert_eq!(label.as_deref(), Some("quick fix"));
+        assert_eq!(edit.document_edits.len(), 1);
+    }
+
+    #[test]
+    fn initialize_capabilities_should_parse_bool_and_object() {
+        let response = json!({
+            "result": {
+                "capabilities": {
+                    "renameProvider": true,
+                    "codeActionProvider": {
+                        "codeActionKinds": ["quickfix"]
+                    },
+                    "documentFormattingProvider": false,
+                    "executeCommandProvider": {
+                        "commands": ["x"]
+                    }
+                }
+            }
+        });
+
+        let capabilities = parse_server_capabilities_from_initialize_response(&response)
+            .expect("initialize capabilities 应可解析");
+        assert!(capabilities.rename);
+        assert!(capabilities.code_action);
+        assert!(!capabilities.formatting);
+        assert!(capabilities.execute_command);
+    }
 }

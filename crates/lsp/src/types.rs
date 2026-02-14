@@ -1,5 +1,9 @@
 use std::path::PathBuf;
 
+use serde_json::Value;
+
+use crate::language::LspLanguage;
+
 /// LSP 诊断级别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticSeverity {
@@ -32,6 +36,19 @@ impl DiagnosticSeverity {
             Self::Hint => "hint",
         }
     }
+
+    /// 将内部诊断级别映射回 LSP 规范数字。
+    ///
+    /// 这里单独提供反向映射，是为了在 `codeAction` 请求里复用诊断上下文，
+    /// 让服务端能基于已有诊断返回更准确的 quick fix。
+    pub fn to_lsp_number(self) -> u8 {
+        match self {
+            Self::Error => 1,
+            Self::Warning => 2,
+            Self::Information => 3,
+            Self::Hint => 4,
+        }
+    }
 }
 
 /// 归一化后的诊断信息。
@@ -42,6 +59,17 @@ pub struct DiagnosticItem {
     pub column: u64,
     pub severity: DiagnosticSeverity,
     pub message: String,
+    /// 诊断起始位置（0-based，LSP 原始坐标）。
+    ///
+    /// UI 展示使用 `line/column`，而 LSP 二次请求（如 `codeAction`）需要原始坐标，
+    /// 因此两套坐标都保留，避免来回换算带来的精度丢失。
+    pub lsp_start_line: usize,
+    pub lsp_start_character: usize,
+    /// 诊断结束位置（0-based，LSP 原始坐标）。
+    pub lsp_end_line: usize,
+    pub lsp_end_character: usize,
+    pub source: Option<String>,
+    pub code: Option<String>,
 }
 
 /// LSP `TextEdit` 的简化结构。
@@ -72,6 +100,52 @@ pub struct LspSemanticToken {
     pub token_modifiers: Vec<String>,
 }
 
+/// LSP `WorkspaceEdit` 中单文件的编辑集合。
+#[derive(Debug, Clone)]
+pub struct LspWorkspaceFileEdit {
+    pub file_path: PathBuf,
+    pub edits: Vec<LspTextEdit>,
+}
+
+/// LSP `WorkspaceEdit` 的简化结构。
+#[derive(Debug, Clone, Default)]
+pub struct LspWorkspaceEdit {
+    pub document_edits: Vec<LspWorkspaceFileEdit>,
+}
+
+impl LspWorkspaceEdit {
+    pub fn is_empty(&self) -> bool {
+        self.document_edits.is_empty()
+    }
+}
+
+/// LSP `Command` 的简化结构。
+#[derive(Debug, Clone)]
+pub struct LspCommand {
+    pub title: String,
+    pub command: String,
+    pub arguments: Vec<Value>,
+}
+
+/// LSP `CodeAction` 的简化结构。
+#[derive(Debug, Clone)]
+pub struct LspCodeAction {
+    pub title: String,
+    pub kind: Option<String>,
+    pub is_preferred: bool,
+    pub edit: Option<LspWorkspaceEdit>,
+    pub command: Option<LspCommand>,
+}
+
+/// 由服务端 `initialize` 响应归一化出的能力标记。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LspServerCapabilities {
+    pub rename: bool,
+    pub code_action: bool,
+    pub formatting: bool,
+    pub execute_command: bool,
+}
+
 /// 由 LSP 客户端发给上层 UI 的事件。
 #[derive(Debug, Clone)]
 pub enum LspEvent {
@@ -94,6 +168,32 @@ pub enum LspEvent {
     SemanticTokens {
         file_path: PathBuf,
         tokens: Vec<LspSemanticToken>,
+    },
+    /// `textDocument/formatting` 返回。
+    FormattingEdits {
+        file_path: PathBuf,
+        edits: Vec<LspTextEdit>,
+    },
+    /// `textDocument/rename` 返回。
+    RenameWorkspaceEdit {
+        file_path: PathBuf,
+        new_name: String,
+        edit: Option<LspWorkspaceEdit>,
+    },
+    /// `textDocument/codeAction` 返回。
+    CodeActions {
+        file_path: PathBuf,
+        actions: Vec<LspCodeAction>,
+    },
+    /// 服务端主动请求客户端执行 `workspace/applyEdit`。
+    ///
+    /// 该请求常见于“执行 quick fix 命令后由服务端回推编辑”，
+    /// 需要上层应用完编辑后再回包，才能形成完整修复闭环。
+    WorkspaceApplyEditRequest {
+        language: LspLanguage,
+        request_id: u64,
+        label: Option<String>,
+        edit: LspWorkspaceEdit,
     },
     /// rust-analyzer 项目加载状态。
     ///

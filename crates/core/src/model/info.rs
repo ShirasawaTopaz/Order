@@ -1,8 +1,10 @@
-use std::{collections::HashSet, env, fs, path::PathBuf};
+use std::{collections::HashSet, env, path::PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+use crate::encoding::read_utf8_text_with_report;
 
 use super::capabilities::ProviderCapabilitiesOverride;
 
@@ -326,8 +328,13 @@ fn load_model_config_file() -> Result<Option<ModelConfigFile>> {
         return Ok(None);
     };
 
-    let content = fs::read_to_string(&config_path)
+    let (content, report) = read_utf8_text_with_report(&config_path)
         .with_context(|| format!("读取模型配置失败: {}", config_path.display()))?;
+    if report.has_warning() {
+        for warning in report.warnings_for(&config_path) {
+            eprintln!("model config encoding warning: {warning}");
+        }
+    }
     if content.trim().is_empty() {
         return Ok(Some(ModelConfigFile::default()));
     }
@@ -651,7 +658,12 @@ fn load_codex_auth_json(codex_dir: &PathBuf) -> Option<String> {
         return None;
     }
 
-    let content = fs::read_to_string(&auth_path).ok()?;
+    let (content, report) = read_utf8_text_with_report(&auth_path).ok()?;
+    if report.has_warning() {
+        for warning in report.warnings_for(&auth_path) {
+            eprintln!("codex auth encoding warning: {warning}");
+        }
+    }
     let value: Value = serde_json::from_str(&content).ok()?;
 
     value
@@ -670,10 +682,15 @@ fn load_codex_config_toml(codex_dir: &PathBuf) -> (String, String) {
         return ("gpt-5.3-codex".to_string(), String::new());
     }
 
-    let content = match fs::read_to_string(&config_path) {
-        Ok(c) => c,
+    let (content, report) = match read_utf8_text_with_report(&config_path) {
+        Ok(result) => result,
         Err(_) => return ("gpt-5.3-codex".to_string(), String::new()),
     };
+    if report.has_warning() {
+        for warning in report.warnings_for(&config_path) {
+            eprintln!("codex config encoding warning: {warning}");
+        }
+    }
 
     let doc: toml::Value = match content.parse() {
         Ok(d) => d,

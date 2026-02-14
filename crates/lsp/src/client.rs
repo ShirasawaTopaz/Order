@@ -13,7 +13,10 @@ use serde_json::Value;
 use crate::{
     language::{LspLanguage, all_languages, detect_language},
     protocol,
-    types::{LspEvent, LspServerCheckItem, LspServerCheckReport},
+    types::{
+        DiagnosticItem, LspCommand, LspEvent, LspServerCapabilities, LspServerCheckItem,
+        LspServerCheckReport,
+    },
 };
 
 pub struct LspClient {
@@ -145,6 +148,18 @@ impl LspClient {
                 }
                 LspEvent::SemanticTokens { tokens, .. } => {
                     self.last_action = format!("semanticTokens({})", tokens.len());
+                }
+                LspEvent::FormattingEdits { edits, .. } => {
+                    self.last_action = format!("formatting({} edits)", edits.len());
+                }
+                LspEvent::RenameWorkspaceEdit { new_name, .. } => {
+                    self.last_action = format!("rename({})", new_name);
+                }
+                LspEvent::CodeActions { actions, .. } => {
+                    self.last_action = format!("codeAction({})", actions.len());
+                }
+                LspEvent::WorkspaceApplyEditRequest { request_id, .. } => {
+                    self.last_action = format!("workspace/applyEdit(request:{request_id})");
                 }
                 LspEvent::RustAnalyzerStatus { message, done } => {
                     self.last_action = if *done {
@@ -441,6 +456,257 @@ impl LspClient {
         Ok(())
     }
 
+    /// 请求 `textDocument/formatting`。
+    pub fn request_formatting(
+        &mut self,
+        file_path: &Path,
+        tab_size: usize,
+        insert_spaces: bool,
+    ) -> Result<()> {
+        let Some(language) = detect_language(file_path) else {
+            return Ok(());
+        };
+        let Some(session) = self.sessions.get_mut(&language) else {
+            return Err(anyhow!("{} LSP 会话不存在", language.display_name()));
+        };
+
+        if !session.running {
+            return Err(anyhow!("{} LSP 会话未运行", language.display_name()));
+        }
+        if !session.initialized {
+            return Err(anyhow!("{} LSP 正在初始化", language.display_name()));
+        }
+        if !session.capabilities.formatting {
+            return Err(anyhow!(
+                "{} LSP 不支持 textDocument/formatting",
+                language.display_name()
+            ));
+        }
+
+        let file_uri = protocol::path_to_file_uri(file_path)
+            .with_context(|| format!("formatting 路径转换失败: {}", file_path.display()))?;
+        let request_id = session.next_request_id();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "textDocument/formatting",
+            "params": {
+                "textDocument": { "uri": file_uri },
+                "options": {
+                    "tabSize": tab_size,
+                    "insertSpaces": insert_spaces
+                }
+            }
+        });
+
+        session
+            .pending_formatting
+            .insert(request_id, file_path.to_path_buf());
+        session.send_or_queue_message(&request)?;
+        self.last_action = format!("formatting request({})", language.language_id());
+        Ok(())
+    }
+
+    /// 请求 `textDocument/rename`。
+    pub fn request_rename(
+        &mut self,
+        file_path: &Path,
+        line: usize,
+        character: usize,
+        new_name: &str,
+    ) -> Result<()> {
+        let Some(language) = detect_language(file_path) else {
+            return Ok(());
+        };
+        let Some(session) = self.sessions.get_mut(&language) else {
+            return Err(anyhow!("{} LSP 会话不存在", language.display_name()));
+        };
+
+        if !session.running {
+            return Err(anyhow!("{} LSP 会话未运行", language.display_name()));
+        }
+        if !session.initialized {
+            return Err(anyhow!("{} LSP 正在初始化", language.display_name()));
+        }
+        if !session.capabilities.rename {
+            return Err(anyhow!(
+                "{} LSP 不支持 textDocument/rename",
+                language.display_name()
+            ));
+        }
+        if new_name.trim().is_empty() {
+            return Err(anyhow!("rename 新名称不能为空"));
+        }
+
+        let file_uri = protocol::path_to_file_uri(file_path)
+            .with_context(|| format!("rename 路径转换失败: {}", file_path.display()))?;
+        let request_id = session.next_request_id();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "textDocument/rename",
+            "params": {
+                "textDocument": { "uri": file_uri },
+                "position": {
+                    "line": line,
+                    "character": character
+                },
+                "newName": new_name
+            }
+        });
+
+        session.pending_rename.insert(
+            request_id,
+            PendingRename {
+                file_path: file_path.to_path_buf(),
+                new_name: new_name.to_string(),
+            },
+        );
+        session.send_or_queue_message(&request)?;
+        self.last_action = format!("rename request({})", language.language_id());
+        Ok(())
+    }
+
+    /// 请求 `textDocument/codeAction`（仅 quick fix）。
+    pub fn request_code_actions(
+        &mut self,
+        file_path: &Path,
+        line: usize,
+        character: usize,
+        diagnostics: &[DiagnosticItem],
+    ) -> Result<()> {
+        let Some(language) = detect_language(file_path) else {
+            return Ok(());
+        };
+        let Some(session) = self.sessions.get_mut(&language) else {
+            return Err(anyhow!("{} LSP 会话不存在", language.display_name()));
+        };
+
+        if !session.running {
+            return Err(anyhow!("{} LSP 会话未运行", language.display_name()));
+        }
+        if !session.initialized {
+            return Err(anyhow!("{} LSP 正在初始化", language.display_name()));
+        }
+        if !session.capabilities.code_action {
+            return Err(anyhow!(
+                "{} LSP 不支持 textDocument/codeAction",
+                language.display_name()
+            ));
+        }
+
+        let file_uri = protocol::path_to_file_uri(file_path)
+            .with_context(|| format!("codeAction 路径转换失败: {}", file_path.display()))?;
+        let request_id = session.next_request_id();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "textDocument/codeAction",
+            "params": {
+                "textDocument": { "uri": file_uri },
+                "range": {
+                    "start": {
+                        "line": line,
+                        "character": character
+                    },
+                    "end": {
+                        "line": line,
+                        "character": character
+                    }
+                },
+                "context": {
+                    "diagnostics": serialize_diagnostics_for_code_action(diagnostics),
+                    "only": ["quickfix"],
+                    "triggerKind": 1
+                }
+            }
+        });
+
+        session
+            .pending_code_action
+            .insert(request_id, file_path.to_path_buf());
+        session.send_or_queue_message(&request)?;
+        self.last_action = format!("codeAction request({})", language.language_id());
+        Ok(())
+    }
+
+    /// 请求 `workspace/executeCommand`。
+    pub fn execute_command(&mut self, file_path: &Path, command: &LspCommand) -> Result<()> {
+        let Some(language) = detect_language(file_path) else {
+            return Ok(());
+        };
+        let Some(session) = self.sessions.get_mut(&language) else {
+            return Err(anyhow!("{} LSP 会话不存在", language.display_name()));
+        };
+
+        if !session.running {
+            return Err(anyhow!("{} LSP 会话未运行", language.display_name()));
+        }
+        if !session.initialized {
+            return Err(anyhow!("{} LSP 正在初始化", language.display_name()));
+        }
+        if !session.capabilities.execute_command {
+            return Err(anyhow!(
+                "{} LSP 不支持 workspace/executeCommand",
+                language.display_name()
+            ));
+        }
+
+        let request_id = session.next_request_id();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "workspace/executeCommand",
+            "params": {
+                "command": command.command.clone(),
+                "arguments": command.arguments.clone()
+            }
+        });
+
+        session.pending_execute_command.insert(
+            request_id,
+            PendingExecuteCommand {
+                file_path: file_path.to_path_buf(),
+                title: command.title.clone(),
+            },
+        );
+        session.send_or_queue_message(&request)?;
+        self.last_action = format!("executeCommand({})", language.language_id());
+        Ok(())
+    }
+
+    /// 回包 `workspace/applyEdit` 请求。
+    ///
+    /// 这里显式返回 `applied/failureReason`，是为了让服务端明确感知客户端应用结果，
+    /// 避免 quick fix 命令在服务端侧出现“已执行但客户端未落地”的状态漂移。
+    pub fn respond_workspace_apply_edit(
+        &mut self,
+        language: LspLanguage,
+        request_id: u64,
+        applied: bool,
+        failure_reason: Option<&str>,
+    ) -> Result<()> {
+        let Some(session) = self.sessions.get_mut(&language) else {
+            return Ok(());
+        };
+
+        let mut result = serde_json::json!({
+            "applied": applied
+        });
+        if !applied && let Some(reason) = failure_reason {
+            result["failureReason"] = serde_json::json!(reason);
+        }
+
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": result
+        });
+        session.send_or_queue_message(&response)?;
+        self.last_action = format!("workspace/applyEdit response({request_id})");
+        Ok(())
+    }
+
     pub fn stop_all(&mut self) {
         for session in self.sessions.values_mut() {
             session.stop();
@@ -462,12 +728,36 @@ enum ReaderMessage {
     Response(Value),
 }
 
+#[derive(Debug, Clone)]
+struct PendingRename {
+    file_path: PathBuf,
+    new_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingExecuteCommand {
+    file_path: PathBuf,
+    title: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PendingRequestKind {
+    WillSaveWaitUntil,
+    Completion,
+    SemanticTokens,
+    Formatting,
+    Rename,
+    CodeAction,
+    ExecuteCommand,
+}
+
 struct LspSession {
     language: LspLanguage,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     running: bool,
     initialized: bool,
+    capabilities: LspServerCapabilities,
     request_id: u64,
     initialize_request_id: Option<u64>,
     event_rx: Option<Receiver<LspEvent>>,
@@ -483,6 +773,10 @@ struct LspSession {
     pending_will_save_wait_until: HashMap<u64, PathBuf>,
     pending_completion: HashMap<u64, PathBuf>,
     pending_semantic_tokens: HashMap<u64, PathBuf>,
+    pending_formatting: HashMap<u64, PathBuf>,
+    pending_rename: HashMap<u64, PendingRename>,
+    pending_code_action: HashMap<u64, PathBuf>,
+    pending_execute_command: HashMap<u64, PendingExecuteCommand>,
 }
 
 impl LspSession {
@@ -521,6 +815,7 @@ impl LspSession {
             stdin: Some(stdin),
             running: true,
             initialized: false,
+            capabilities: LspServerCapabilities::default(),
             request_id: 1,
             initialize_request_id: None,
             event_rx: None,
@@ -540,6 +835,10 @@ impl LspSession {
             pending_will_save_wait_until: HashMap::new(),
             pending_completion: HashMap::new(),
             pending_semantic_tokens: HashMap::new(),
+            pending_formatting: HashMap::new(),
+            pending_rename: HashMap::new(),
+            pending_code_action: HashMap::new(),
+            pending_execute_command: HashMap::new(),
         };
 
         session.send_initialize_sequence(workspace_root)?;
@@ -579,6 +878,11 @@ impl LspSession {
                 self.semantic_token_types = token_types;
                 self.semantic_token_modifiers = token_modifiers;
             }
+            if let Some(capabilities) =
+                protocol::parse_server_capabilities_from_initialize_response(&response)
+            {
+                self.capabilities = capabilities;
+            }
 
             self.initialized = true;
             if let Err(error) = self.flush_pending_messages() {
@@ -595,27 +899,21 @@ impl LspSession {
             return None;
         };
 
-        // 在统一错误分支前先识别请求类型，便于按请求执行降级策略。
-        let is_will_save_wait_until = self.pending_will_save_wait_until.contains_key(&request_id);
-        let is_completion = self.pending_completion.contains_key(&request_id);
-        let is_semantic_tokens = self.pending_semantic_tokens.contains_key(&request_id);
+        let pending_kind = self.pending_request_kind(request_id);
 
         if let Some(error) = response.get("error") {
-            // 错误响应同样需要清理 pending，避免请求索引表残留。
-            if is_will_save_wait_until {
-                self.pending_will_save_wait_until.remove(&request_id);
+            self.clear_pending_request(request_id);
 
-                // 对“方法不存在”做一次降级：后续不再发送该请求，并静默当前错误。
-                if is_method_not_found_error(error) {
-                    self.will_save_wait_until_supported = false;
+            // 统一处理“方法不存在”降级，避免后续重复误调用。
+            if let Some(kind) = pending_kind
+                && is_method_not_found_error(error)
+            {
+                self.disable_capability_for_missing_method(kind);
+
+                // willSaveWaitUntil 是保存链路上的可选能力，降级后无需打断用户流程。
+                if matches!(kind, PendingRequestKind::WillSaveWaitUntil) {
                     return None;
                 }
-            }
-            if is_completion {
-                self.pending_completion.remove(&request_id);
-            }
-            if is_semantic_tokens {
-                self.pending_semantic_tokens.remove(&request_id);
             }
 
             let error_msg = error
@@ -655,7 +953,97 @@ impl LspSession {
             });
         }
 
+        if let Some(file_path) = self.pending_formatting.remove(&request_id) {
+            return Some(LspEvent::FormattingEdits {
+                file_path,
+                edits: protocol::parse_text_edits_from_response(&response),
+            });
+        }
+
+        if let Some(pending) = self.pending_rename.remove(&request_id) {
+            return Some(LspEvent::RenameWorkspaceEdit {
+                file_path: pending.file_path,
+                new_name: pending.new_name,
+                edit: protocol::parse_workspace_edit_from_response(&response),
+            });
+        }
+
+        if let Some(file_path) = self.pending_code_action.remove(&request_id) {
+            return Some(LspEvent::CodeActions {
+                file_path,
+                actions: protocol::parse_code_actions_from_response(&response),
+            });
+        }
+
+        if let Some(pending) = self.pending_execute_command.remove(&request_id) {
+            return Some(LspEvent::Status(format!(
+                "{} 命令已执行：{}（{}）",
+                self.language.display_name(),
+                pending.title,
+                pending.file_path.display()
+            )));
+        }
+
         None
+    }
+
+    /// 判断请求 id 对应的待处理请求类型。
+    fn pending_request_kind(&self, request_id: u64) -> Option<PendingRequestKind> {
+        if self.pending_will_save_wait_until.contains_key(&request_id) {
+            return Some(PendingRequestKind::WillSaveWaitUntil);
+        }
+        if self.pending_completion.contains_key(&request_id) {
+            return Some(PendingRequestKind::Completion);
+        }
+        if self.pending_semantic_tokens.contains_key(&request_id) {
+            return Some(PendingRequestKind::SemanticTokens);
+        }
+        if self.pending_formatting.contains_key(&request_id) {
+            return Some(PendingRequestKind::Formatting);
+        }
+        if self.pending_rename.contains_key(&request_id) {
+            return Some(PendingRequestKind::Rename);
+        }
+        if self.pending_code_action.contains_key(&request_id) {
+            return Some(PendingRequestKind::CodeAction);
+        }
+        if self.pending_execute_command.contains_key(&request_id) {
+            return Some(PendingRequestKind::ExecuteCommand);
+        }
+        None
+    }
+
+    /// 清理指定请求 id 的 pending 状态。
+    fn clear_pending_request(&mut self, request_id: u64) {
+        self.pending_will_save_wait_until.remove(&request_id);
+        self.pending_completion.remove(&request_id);
+        self.pending_semantic_tokens.remove(&request_id);
+        self.pending_formatting.remove(&request_id);
+        self.pending_rename.remove(&request_id);
+        self.pending_code_action.remove(&request_id);
+        self.pending_execute_command.remove(&request_id);
+    }
+
+    /// 遇到 method-not-found 时按请求类型做能力降级。
+    fn disable_capability_for_missing_method(&mut self, kind: PendingRequestKind) {
+        match kind {
+            PendingRequestKind::WillSaveWaitUntil => {
+                self.will_save_wait_until_supported = false;
+            }
+            PendingRequestKind::Formatting => {
+                self.capabilities.formatting = false;
+            }
+            PendingRequestKind::Rename => {
+                self.capabilities.rename = false;
+            }
+            PendingRequestKind::CodeAction => {
+                self.capabilities.code_action = false;
+            }
+            PendingRequestKind::ExecuteCommand => {
+                self.capabilities.execute_command = false;
+            }
+            PendingRequestKind::Completion | PendingRequestKind::SemanticTokens => {}
+        }
     }
 
     fn send_initialize_sequence(&mut self, workspace_root: &Path) -> Result<()> {
@@ -677,11 +1065,35 @@ impl LspSession {
                 },
                 "rootUri": root_uri,
                 "capabilities": {
+                    "workspace": {
+                        "applyEdit": true,
+                        "workspaceEdit": {
+                            "documentChanges": true
+                        }
+                    },
                     "textDocument": {
                         "completion": {
                             "completionItem": {
                                 "snippetSupport": true
                             }
+                        },
+                        "codeAction": {
+                            "dynamicRegistration": false,
+                            "codeActionLiteralSupport": {
+                                "codeActionKind": {
+                                    "valueSet": [
+                                        "quickfix",
+                                        "refactor",
+                                        "source"
+                                    ]
+                                }
+                            }
+                        },
+                        "rename": {
+                            "dynamicRegistration": false
+                        },
+                        "formatting": {
+                            "dynamicRegistration": false
                         },
                         "semanticTokens": {
                             "dynamicRegistration": false,
@@ -840,7 +1252,22 @@ fn spawn_reader_thread(
                 continue;
             }
 
-            if protocol::response_request_id(&message).is_some() {
+            if protocol::is_workspace_apply_edit_request(&message)
+                && let Some((request_id, label, edit)) =
+                    protocol::parse_workspace_apply_edit_request(&message)
+            {
+                let _ = reader_tx.send(ReaderMessage::Event(LspEvent::WorkspaceApplyEditRequest {
+                    language,
+                    request_id,
+                    label,
+                    edit,
+                }));
+                continue;
+            }
+
+            // 仅把“method 为空的消息”视为 response，避免把服务端请求误判进响应分支。
+            if protocol::response_request_id(&message).is_some() && message.get("method").is_none()
+            {
                 let _ = reader_tx.send(ReaderMessage::Response(message));
             }
         }
@@ -855,6 +1282,38 @@ impl LspClient {
         }
         events
     }
+}
+
+/// 将内部诊断结构转换为 `codeAction` 上下文所需的 LSP 诊断 JSON。
+///
+/// quick fix 能力高度依赖诊断上下文，若只传空数组，服务端通常只能返回很少的动作。
+fn serialize_diagnostics_for_code_action(diagnostics: &[DiagnosticItem]) -> Vec<Value> {
+    diagnostics
+        .iter()
+        .map(|item| {
+            let mut diagnostic = serde_json::json!({
+                "range": {
+                    "start": {
+                        "line": item.lsp_start_line,
+                        "character": item.lsp_start_character
+                    },
+                    "end": {
+                        "line": item.lsp_end_line,
+                        "character": item.lsp_end_character
+                    }
+                },
+                "severity": item.severity.to_lsp_number(),
+                "message": item.message.clone()
+            });
+            if let Some(source) = item.source.as_deref() {
+                diagnostic["source"] = serde_json::json!(source);
+            }
+            if let Some(code) = item.code.as_deref() {
+                diagnostic["code"] = serde_json::json!(code);
+            }
+            diagnostic
+        })
+        .collect()
 }
 
 /// 判断错误是否属于“方法不存在”。
@@ -906,7 +1365,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{LspEvent, LspLanguage, LspSession, ReaderMessage};
+    use super::{LspEvent, LspLanguage, LspServerCapabilities, LspSession, ReaderMessage};
 
     fn build_minimal_session() -> LspSession {
         let (_reader_tx, reader_rx) = mpsc::channel::<ReaderMessage>();
@@ -919,6 +1378,12 @@ mod tests {
             stdin: None,
             running: true,
             initialized: false,
+            capabilities: LspServerCapabilities {
+                rename: true,
+                code_action: true,
+                formatting: true,
+                execute_command: true,
+            },
             request_id: 3,
             initialize_request_id: Some(1),
             event_rx: None,
@@ -930,6 +1395,10 @@ mod tests {
             pending_will_save_wait_until: HashMap::new(),
             pending_completion: HashMap::new(),
             pending_semantic_tokens,
+            pending_formatting: HashMap::new(),
+            pending_rename: HashMap::new(),
+            pending_code_action: HashMap::new(),
+            pending_execute_command: HashMap::new(),
         }
     }
 
@@ -1008,6 +1477,40 @@ mod tests {
     }
 
     #[test]
+    fn initialize_response_should_capture_server_capabilities() {
+        let mut session = build_minimal_session();
+
+        let initialize_response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "capabilities": {
+                    "renameProvider": true,
+                    "codeActionProvider": {
+                        "codeActionKinds": ["quickfix"]
+                    },
+                    "documentFormattingProvider": false,
+                    "executeCommandProvider": {
+                        "commands": ["rust-analyzer.applySourceChange"]
+                    },
+                    "semanticTokensProvider": {
+                        "legend": {
+                            "tokenTypes": ["macro"],
+                            "tokenModifiers": []
+                        }
+                    }
+                }
+            }
+        });
+
+        assert!(session.map_response(initialize_response).is_none());
+        assert!(session.capabilities.rename);
+        assert!(session.capabilities.code_action);
+        assert!(!session.capabilities.formatting);
+        assert!(session.capabilities.execute_command);
+    }
+
+    #[test]
     fn will_save_wait_until_unknown_request_should_disable_request() {
         let mut session = build_minimal_session();
         session
@@ -1027,5 +1530,26 @@ mod tests {
         assert!(event.is_none());
         assert!(!session.will_save_wait_until_supported);
         assert!(!session.pending_will_save_wait_until.contains_key(&9));
+    }
+
+    #[test]
+    fn formatting_unknown_request_should_disable_capability() {
+        let mut session = build_minimal_session();
+        session
+            .pending_formatting
+            .insert(7, PathBuf::from("main.rs"));
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "error": {
+                "code": -32601,
+                "message": "method not found"
+            }
+        });
+
+        let _ = session.map_response(response);
+        assert!(!session.capabilities.formatting);
+        assert!(!session.pending_formatting.contains_key(&7));
     }
 }

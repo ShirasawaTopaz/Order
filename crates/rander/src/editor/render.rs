@@ -58,6 +58,9 @@ impl Editor {
         if self.mode == EditorMode::BufferPicker {
             self.render_buffer_picker(frame, area, palette);
         }
+        if self.mode == EditorMode::RenameInput {
+            self.render_rename_input_popup(frame, area, palette);
+        }
         if self.mode == EditorMode::Insert && !self.completion_items.is_empty() {
             self.render_completion_popover(frame, area, palette);
         }
@@ -246,6 +249,7 @@ impl Editor {
             EditorMode::Visual => "VISUAL",
             EditorMode::Terminal => "TERMINAL",
             EditorMode::BufferPicker => "BUFFER",
+            EditorMode::RenameInput => "RENAME",
         };
         let mut title = format!(" {} [{}] ", buffer.name, mode_text);
         if buffer.modified {
@@ -866,6 +870,7 @@ impl Editor {
             EditorMode::Visual => "VISUAL",
             EditorMode::Terminal => "TERM",
             EditorMode::BufferPicker => "BUFFER",
+            EditorMode::RenameInput => "RENAME",
         };
         let lsp_indicator = if self.lsp_client.is_running() {
             "●"
@@ -923,6 +928,59 @@ impl Editor {
 
         Paragraph::new(lines)
             .block(Block::bordered().title(" Buffers "))
+            .render(popup, frame.buffer_mut());
+    }
+
+    /// 渲染 LSP rename 输入弹窗。
+    pub(super) fn render_rename_input_popup(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        palette: ThemePalette,
+    ) {
+        let width = min(72, area.width.saturating_sub(4));
+        let height = 6;
+        let popup = Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        };
+        Clear.render(popup, frame.buffer_mut());
+
+        let input_display = if self.rename_input.is_empty() {
+            "<请输入新名称>".to_string()
+        } else {
+            self.rename_input.clone()
+        };
+        let lines = vec![
+            Line::from(Span::styled(
+                "LSP Rename",
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled("新名称: ", Style::default().fg(palette.dim)),
+                Span::styled(
+                    input_display,
+                    Style::default()
+                        .fg(palette.fg)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "Enter 确认，Esc 取消",
+                Style::default().fg(palette.dim),
+            )),
+        ];
+
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .title(" Rename ")
+                    .border_style(Style::default().fg(palette.accent)),
+            )
             .render(popup, frame.buffer_mut());
     }
 

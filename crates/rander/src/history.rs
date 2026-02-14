@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Local;
+use core::encoding::{read_utf8_text_with_report, write_utf8_text_with_report};
 use rig::completion::Message as RigMessage;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -775,8 +776,14 @@ fn read_memory_file(path: &Path) -> Result<ContextMemoryFile> {
         return Ok(ContextMemoryFile::default());
     }
 
-    let content = fs::read_to_string(path)
+    let (content, report) = read_utf8_text_with_report(path)
         .with_context(|| format!("读取上下文记忆失败: {}", path.display()))?;
+    if report.has_warning() {
+        for warning in report.warnings_for(path) {
+            // 记忆文件在启动阶段读取，无法安全回显到 TUI，这里使用标准错误输出提示排障信息。
+            eprintln!("context memory encoding warning: {warning}");
+        }
+    }
     if content.trim().is_empty() {
         return Ok(ContextMemoryFile::default());
     }
@@ -799,7 +806,14 @@ fn write_memory_file(path: &Path, file: &ContextMemoryFile) -> Result<()> {
 
     let mut content = serde_json::to_string_pretty(file).context("序列化上下文记忆失败")?;
     content.push('\n');
-    fs::write(path, content).with_context(|| format!("写入上下文记忆失败: {}", path.display()))
+    let report = write_utf8_text_with_report(path, &content)
+        .with_context(|| format!("写入上下文记忆失败: {}", path.display()))?;
+    if report.has_warning() {
+        for warning in report.warnings_for(path) {
+            eprintln!("context memory encoding warning: {warning}");
+        }
+    }
+    Ok(())
 }
 
 /// 解析当前任务 ID。
