@@ -16,9 +16,6 @@ use crate::{
     types::{LspEvent, LspServerCheckItem, LspServerCheckReport},
 };
 
-/// 澶氳瑷€ LSP 瀹㈡埛绔€?///
-/// 鏍稿績鑱岃矗锛?/// - 鎸夎瑷€鎯版€ф媺璧疯瑷€鏈嶅姟鍣紝闄嶄綆璧勬簮鍗犵敤锛?/// - 缁熶竴灏佽 didOpen/didChange/琛ュ叏/璇箟楂樹寒 绛夎兘鍔涳紱
-/// - 灏?LSP 鍘熷鍗忚缁嗚妭闅旂鍦?crate 鍐咃紝鍚戜笂灞傛彁渚涚ǔ瀹氫簨浠躲€?
 pub struct LspClient {
     sessions: HashMap<LspLanguage, LspSession>,
     status_message: String,
@@ -32,7 +29,6 @@ impl Default for LspClient {
 }
 
 impl LspClient {
-    /// 鍒涘缓绌哄鎴风锛屼笉浼氱珛鍗冲惎鍔ㄤ换浣曡瑷€鏈嶅姟銆?    
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
@@ -41,33 +37,24 @@ impl LspClient {
         }
     }
 
-    /// 鑾峰彇鐘舵€佹爮鏂囨湰銆?    
     pub fn status_message(&self) -> &str {
         &self.status_message
     }
 
-    /// 鑾峰彇鏈€杩戝姩浣滄弿杩般€?    
     pub fn last_action(&self) -> &str {
         &self.last_action
     }
 
-    /// 鏄惁瀛樺湪鑷冲皯涓€涓椿璺冧細璇濄€?    
     pub fn is_running(&self) -> bool {
         self.sessions.values().any(|session| session.running)
     }
 
-    /// 判断指定语言会话是否正在运行。
-    ///
-    /// 该能力用于上层在“自动激活”场景下做幂等控制，
-    /// 避免每一帧都重复发送 `didOpen`。
     pub fn is_language_running(&self, language: LspLanguage) -> bool {
         self.sessions
             .get(&language)
             .is_some_and(|session| session.running)
     }
 
-    /// 妫€鏌ユ墍鏈夊彈鏀寔璇█鏈嶅姟鍣ㄦ槸鍚﹀彲鐢ㄣ€?    ///
-    /// 璇ュ嚱鏁颁笉浼氬惎鍔ㄦ湇鍔″櫒杩涚▼锛屽彧閫氳繃绯荤粺 PATH 鍙墽琛屾€у仛蹇€熸帰娴嬨€?    
     pub fn check_server_availability(&self) -> LspServerCheckReport {
         let mut items = Vec::new();
         for language in all_languages() {
@@ -83,7 +70,6 @@ impl LspClient {
         LspServerCheckReport { items }
     }
 
-    /// 鏍规嵁鏂囦欢璺緞纭繚璇█浼氳瘽宸插惎鍔ㄣ€?    
     pub fn ensure_started_for_file(
         &mut self,
         workspace_root: &Path,
@@ -95,7 +81,6 @@ impl LspClient {
         self.ensure_started_for_language(workspace_root, language)
     }
 
-    /// 纭繚鎸囧畾璇█浼氳瘽宸插惎鍔ㄣ€?    
     pub fn ensure_started_for_language(
         &mut self,
         workspace_root: &Path,
@@ -127,7 +112,6 @@ impl LspClient {
         Ok(())
     }
 
-    /// 鍚屾浼氳瘽瀛樻椿鐘舵€併€?    
     pub fn sync_running_state(&mut self) -> Result<()> {
         let mut exited_languages = Vec::new();
         for (language, session) in &mut self.sessions {
@@ -142,7 +126,6 @@ impl LspClient {
         Ok(())
     }
 
-    /// 鎷夊彇鎵€鏈変細璇濅簨浠躲€?    
     pub fn poll_events(&mut self) -> Vec<LspEvent> {
         let mut events = self.drain_session_events();
         for event in &events {
@@ -185,7 +168,6 @@ impl LspClient {
         events
     }
 
-    /// 鍙戦€?`textDocument/didOpen`銆?    
     pub fn send_did_open(
         &mut self,
         workspace_root: &Path,
@@ -204,7 +186,7 @@ impl LspClient {
             .ok_or_else(|| anyhow!("{} 会话不存在", language.language_id()))?;
 
         let file_uri = protocol::path_to_file_uri(file_path)
-            .with_context(|| format!("didOpen 璺緞杞崲澶辫触: {}", file_path.display()))?;
+            .with_context(|| format!("didOpen 路径转换失败: {}", file_path.display()))?;
         let did_open = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didOpen",
@@ -223,7 +205,6 @@ impl LspClient {
         Ok(())
     }
 
-    /// 鍙戦€?`textDocument/didClose`銆?    
     pub fn send_did_close(&mut self, file_path: &Path) -> Result<()> {
         let Some(language) = detect_language(file_path) else {
             return Ok(());
@@ -233,7 +214,7 @@ impl LspClient {
         };
 
         let file_uri = protocol::path_to_file_uri(file_path)
-            .with_context(|| format!("didClose 璺緞杞崲澶辫触: {}", file_path.display()))?;
+            .with_context(|| format!("didClose 路径转换失败: {}", file_path.display()))?;
         let did_close = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didClose",
@@ -246,7 +227,6 @@ impl LspClient {
         Ok(())
     }
 
-    /// 鍙戦€?`textDocument/didSave`銆?    
     pub fn send_did_save(&mut self, file_path: &Path, text: &str) -> Result<()> {
         let Some(language) = detect_language(file_path) else {
             return Ok(());
@@ -256,7 +236,7 @@ impl LspClient {
         };
 
         let file_uri = protocol::path_to_file_uri(file_path)
-            .with_context(|| format!("didSave 璺緞杞崲澶辫触: {}", file_path.display()))?;
+            .with_context(|| format!("didSave 路径转换失败: {}", file_path.display()))?;
         let did_save = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didSave",
@@ -270,7 +250,6 @@ impl LspClient {
         Ok(())
     }
 
-    /// 鍙戦€?`textDocument/didChange`銆?    
     pub fn send_did_change(
         &mut self,
         file_path: &Path,
@@ -286,7 +265,7 @@ impl LspClient {
         };
 
         let file_uri = protocol::path_to_file_uri(file_path)
-            .with_context(|| format!("didChange 璺緞杞崲澶辫触: {}", file_path.display()))?;
+            .with_context(|| format!("didChange 路径转换失败: {}", file_path.display()))?;
 
         let mut content_changes: Vec<Value> = protocol::compute_incremental_changes(
             old_text, new_text,
@@ -308,7 +287,6 @@ impl LspClient {
             return Ok(());
         }
 
-        // 采用“从后到前”的编辑顺序，避免前序变更影响后序 range 偏移。
         content_changes.reverse();
 
         let did_change = serde_json::json!({
@@ -328,7 +306,6 @@ impl LspClient {
         Ok(())
     }
 
-    /// 鍙戦€?`textDocument/willSave`銆?    
     pub fn send_will_save(&mut self, file_path: &Path) -> Result<()> {
         let Some(language) = detect_language(file_path) else {
             return Ok(());
@@ -338,7 +315,7 @@ impl LspClient {
         };
 
         let file_uri = protocol::path_to_file_uri(file_path)
-            .with_context(|| format!("willSave 璺緞杞崲澶辫触: {}", file_path.display()))?;
+            .with_context(|| format!("willSave 路径转换失败: {}", file_path.display()))?;
         let will_save = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "textDocument/willSave",
@@ -353,7 +330,6 @@ impl LspClient {
         Ok(())
     }
 
-    /// 鍙戦€?`textDocument/willSaveWaitUntil` 璇锋眰銆?    
     pub fn send_will_save_wait_until(&mut self, file_path: &Path) -> Result<()> {
         let Some(language) = detect_language(file_path) else {
             return Ok(());
@@ -362,9 +338,15 @@ impl LspClient {
             return Ok(());
         };
 
+        // 已确认不支持时直接跳过，避免每次保存都触发服务端错误响应。
+        if !session.will_save_wait_until_supported {
+            self.last_action = format!("willSaveWaitUntil(skip:{})", language.language_id());
+            return Ok(());
+        }
+
         let file_uri = protocol::path_to_file_uri(file_path).with_context(|| {
             format!(
-                "willSaveWaitUntil 璺緞杞崲澶辫触: {}",
+                "willSaveWaitUntil 路径转换失败: {}",
                 file_path.display()
             )
         })?;
@@ -387,7 +369,6 @@ impl LspClient {
         Ok(())
     }
 
-    /// 璇锋眰琛ュ叏銆?    
     pub fn request_completion(
         &mut self,
         file_path: &Path,
@@ -398,11 +379,19 @@ impl LspClient {
             return Ok(());
         };
         let Some(session) = self.sessions.get_mut(&language) else {
-            return Ok(());
+            return Err(anyhow!("{} LSP 会话不存在", language.display_name()));
         };
 
+        if !session.running {
+            return Err(anyhow!("{} LSP 会话未运行", language.display_name()));
+        }
+
+        if !session.initialized {
+            return Err(anyhow!("{} LSP 正在初始化", language.display_name()));
+        }
+
         let file_uri = protocol::path_to_file_uri(file_path)
-            .with_context(|| format!("completion 璺緞杞崲澶辫触: {}", file_path.display()))?;
+            .with_context(|| format!("completion 路径转换失败: {}", file_path.display()))?;
         let request_id = session.next_request_id();
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -428,7 +417,6 @@ impl LspClient {
         Ok(())
     }
 
-    /// 璇锋眰璇箟楂樹寒 token銆?    
     pub fn request_semantic_tokens(&mut self, file_path: &Path) -> Result<()> {
         let Some(language) = detect_language(file_path) else {
             return Ok(());
@@ -438,7 +426,7 @@ impl LspClient {
         };
 
         let file_uri = protocol::path_to_file_uri(file_path)
-            .with_context(|| format!("semanticTokens 璺緞杞崲澶辫触: {}", file_path.display()))?;
+            .with_context(|| format!("semanticTokens 路径转换失败: {}", file_path.display()))?;
         let request_id = session.next_request_id();
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -457,7 +445,6 @@ impl LspClient {
         Ok(())
     }
 
-    /// 鍋滄鍏ㄩ儴浼氳瘽銆?    
     pub fn stop_all(&mut self) {
         for session in self.sessions.values_mut() {
             session.stop();
@@ -474,13 +461,11 @@ impl Drop for LspClient {
     }
 }
 
-/// 鍐呴儴绾跨▼娑堟伅銆?
 enum ReaderMessage {
     Event(LspEvent),
     Response(Value),
 }
 
-/// 鍗曡瑷€浼氳瘽銆?
 struct LspSession {
     language: LspLanguage,
     child: Option<Child>,
@@ -494,13 +479,17 @@ struct LspSession {
     semantic_token_types: Vec<String>,
     semantic_token_modifiers: Vec<String>,
     pending_messages: Vec<Value>,
+    /// 服务端是否支持 `textDocument/willSaveWaitUntil`。
+    ///
+    /// 默认按“支持”处理；若服务端返回 method-not-found，
+    /// 则自动降级为不再发送该请求，避免保存时反复出现 unknown request。
+    will_save_wait_until_supported: bool,
     pending_will_save_wait_until: HashMap<u64, PathBuf>,
     pending_completion: HashMap<u64, PathBuf>,
     pending_semantic_tokens: HashMap<u64, PathBuf>,
 }
 
 impl LspSession {
-    /// 鍚姩浼氳瘽骞跺畬鎴愬垵濮嬪寲銆?    
     fn spawn(workspace_root: &Path, language: LspLanguage) -> Result<Self> {
         let (binary, args) = language.server_command();
         let mut command = Command::new(binary);
@@ -508,7 +497,7 @@ impl LspSession {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .current_dir(workspace_root);
 
         let mut child = command.spawn().with_context(|| {
@@ -521,16 +510,14 @@ impl LspSession {
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| anyhow!("鏃犳硶鑾峰彇 {} 鏍囧噯杈撳叆", language.language_id()))?;
+            .ok_or_else(|| anyhow!("无法获取 {} 标准输入", language.language_id()))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| anyhow!("鏃犳硶鑾峰彇 {} 鏍囧噯杈撳嚭", language.language_id()))?;
+            .ok_or_else(|| anyhow!("无法获取 {} 标准输出", language.language_id()))?;
 
         let (reader_tx, reader_rx) = mpsc::channel::<ReaderMessage>();
         spawn_reader_thread(stdout, reader_tx, language);
-
-        let (_event_tx, event_rx) = mpsc::channel::<LspEvent>();
 
         let mut session = Self {
             language,
@@ -540,7 +527,7 @@ impl LspSession {
             initialized: false,
             request_id: 1,
             initialize_request_id: None,
-            event_rx: Some(event_rx),
+            event_rx: None,
             reader_rx,
             semantic_token_types: language
                 .semantic_token_types()
@@ -553,6 +540,7 @@ impl LspSession {
                 .map(|item| (*item).to_string())
                 .collect(),
             pending_messages: Vec::new(),
+            will_save_wait_until_supported: true,
             pending_will_save_wait_until: HashMap::new(),
             pending_completion: HashMap::new(),
             pending_semantic_tokens: HashMap::new(),
@@ -562,7 +550,6 @@ impl LspSession {
         Ok(session)
     }
 
-    /// 鍒锋柊璇诲彇绾跨▼娑堟伅锛屽苟鏄犲皠涓洪珮灞備簨浠躲€?    
     fn drain_reader_messages(&mut self) -> Vec<LspEvent> {
         let mut events = Vec::new();
 
@@ -585,11 +572,10 @@ impl LspSession {
         events
     }
 
-    /// 灏嗗搷搴旀槧灏勪负楂樺眰浜嬩欢銆?    
     fn map_response(&mut self, response: Value) -> Option<LspEvent> {
-        let request_id = protocol::response_request_id(&response)?;
+        let request_id = protocol::response_request_id(&response);
 
-        if self.initialize_request_id == Some(request_id) {
+        if self.initialize_request_id.is_some() && self.initialize_request_id == request_id {
             self.initialize_request_id = None;
             if let Some((token_types, token_modifiers)) =
                 protocol::parse_semantic_legend_from_initialize_response(&response)
@@ -609,6 +595,43 @@ impl LspSession {
             return None;
         }
 
+        let Some(request_id) = request_id else {
+            return None;
+        };
+
+        // 在统一错误分支前先识别请求类型，便于按请求执行降级策略。
+        let is_will_save_wait_until = self.pending_will_save_wait_until.contains_key(&request_id);
+        let is_completion = self.pending_completion.contains_key(&request_id);
+        let is_semantic_tokens = self.pending_semantic_tokens.contains_key(&request_id);
+
+        if let Some(error) = response.get("error") {
+            // 错误响应同样需要清理 pending，避免请求索引表残留。
+            if is_will_save_wait_until {
+                self.pending_will_save_wait_until.remove(&request_id);
+
+                // 对“方法不存在”做一次降级：后续不再发送该请求，并静默当前错误。
+                if is_method_not_found_error(error) {
+                    self.will_save_wait_until_supported = false;
+                    return None;
+                }
+            }
+            if is_completion {
+                self.pending_completion.remove(&request_id);
+            }
+            if is_semantic_tokens {
+                self.pending_semantic_tokens.remove(&request_id);
+            }
+
+            let error_msg = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("未知错误");
+            return Some(LspEvent::Status(format!(
+                "[LSP错误] 请求 {} 失败: {}",
+                request_id, error_msg
+            )));
+        }
+
         if !protocol::has_result(&response) {
             return None;
         }
@@ -621,9 +644,10 @@ impl LspSession {
         }
 
         if let Some(file_path) = self.pending_completion.remove(&request_id) {
+            let items = protocol::parse_completion_items_from_response(&response);
             return Some(LspEvent::CompletionItems {
                 file_path,
-                items: protocol::parse_completion_items_from_response(&response),
+                items,
             });
         }
 
@@ -641,11 +665,10 @@ impl LspSession {
         None
     }
 
-    /// 鍙戦€佸垵濮嬪寲鎻℃墜銆?    
     fn send_initialize_sequence(&mut self, workspace_root: &Path) -> Result<()> {
         let root_uri = protocol::path_to_file_uri(workspace_root).with_context(|| {
             format!(
-                "宸ヤ綔鍖鸿矾寰勬棤娉曡浆鎹负 URI: {}",
+                "工作区路径无法转换为 URI: {}",
                 workspace_root.display()
             )
         })?;
@@ -695,7 +718,6 @@ impl LspSession {
         self.send_message(&initialized)
     }
 
-    /// 鍙戦€佸崟鏉℃秷鎭€?
     fn send_message(&mut self, value: &Value) -> Result<()> {
         let stdin = self
             .stdin
@@ -704,7 +726,6 @@ impl LspSession {
         protocol::send_message(stdin, value)
     }
 
-    /// 在初始化完成前缓存消息，避免服务端尚未就绪时丢失 didOpen/semantic 请求。
     fn send_or_queue_message(&mut self, value: &Value) -> Result<()> {
         if self.initialized {
             return self.send_message(value);
@@ -714,7 +735,6 @@ impl LspSession {
         Ok(())
     }
 
-    /// 初始化成功后按原顺序回放缓存消息，保证编辑状态与服务端一致。
     fn flush_pending_messages(&mut self) -> Result<()> {
         if !self.initialized || self.pending_messages.is_empty() {
             return Ok(());
@@ -728,14 +748,12 @@ impl LspSession {
         Ok(())
     }
 
-    /// 鍒嗛厤璇锋眰 id銆?
     fn next_request_id(&mut self) -> u64 {
         let request_id = self.request_id;
         self.request_id = self.request_id.saturating_add(1);
         request_id
     }
 
-    /// 鍚屾杩涚▼鐘舵€併€?    
     fn sync_running_state(&mut self) -> Result<bool> {
         let Some(child) = self.child.as_mut() else {
             self.running = false;
@@ -759,7 +777,6 @@ impl LspSession {
         }
     }
 
-    /// 鍋滄浼氳瘽銆?    
     fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -770,7 +787,6 @@ impl LspSession {
         self.running = false;
     }
 
-    /// 鍏煎浜嬩欢閫氶亾鐨勯潪闃诲璇诲彇銆?    
     fn drain_legacy_events(&mut self) -> Option<LspEvent> {
         let rx = self.event_rx.as_ref()?;
         match rx.try_recv() {
@@ -785,7 +801,6 @@ impl LspSession {
     }
 }
 
-/// 鍚姩璇诲彇绾跨▼锛岃礋璐ｅ崗璁В鍖呬笌鍩虹鍒嗙被銆?
 fn spawn_reader_thread(
     stdout: std::process::ChildStdout,
     reader_tx: Sender<ReaderMessage>,
@@ -806,7 +821,7 @@ fn spawn_reader_thread(
                 }
                 Err(error) => {
                     let _ = reader_tx.send(ReaderMessage::Event(LspEvent::Status(format!(
-                        "{} 杈撳嚭璇诲彇澶辫触: {}",
+                        "{} 输出读取失败: {}",
                         language.language_id(),
                         error
                     ))));
@@ -844,7 +859,6 @@ fn spawn_reader_thread(
 }
 
 impl LspClient {
-    /// 浠庡悇浼氳瘽璇诲彇绾跨▼涓彁鍙栧苟鍚堝苟浜嬩欢銆?    
     fn drain_session_events(&mut self) -> Vec<LspEvent> {
         let mut events = Vec::new();
         for session in self.sessions.values_mut() {
@@ -854,9 +868,27 @@ impl LspClient {
     }
 }
 
-/// 鍒ゆ柇鍛戒护鏄惁鍙湪褰撳墠绯荤粺 PATH 涓墽琛屻€?///
-/// 浣跨敤骞冲彴鍘熺敓鍛戒护锛圵indows: `where`锛屽叾浠? `which`锛夎繘琛屾娴嬶紝
-/// 鍙互閬垮厤鐩存帴灏濊瘯鍚姩 LSP 杩涚▼甯︽潵鐨勫壇浣滅敤銆?
+/// 判断错误是否属于“方法不存在”。
+///
+/// 优先使用标准 JSON-RPC code `-32601`，并兼容常见字符串错误文本，
+/// 以覆盖不同语言服务器的实现差异。
+fn is_method_not_found_error(error: &Value) -> bool {
+    if error
+        .get("code")
+        .and_then(Value::as_i64)
+        .is_some_and(|code| code == -32601)
+    {
+        return true;
+    }
+
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    message.contains("method not found") || message.contains("unknown request")
+}
+
 fn is_command_available(command: &str) -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -887,8 +919,6 @@ mod tests {
 
     use super::{LspEvent, LspLanguage, LspSession, ReaderMessage};
 
-    /// 鏋勯€犱竴涓渶灏忎細璇濓紝鐢ㄤ簬楠岃瘉 initialize 涓?semanticTokens 鐨勫搷搴斾覆鑱斻€?    ///
-    /// 杩欓噷涓嶅惎鍔ㄧ湡瀹炶瑷€鏈嶅姟锛岃€屾槸鐩存帴鍠傚叆 JSON-RPC 鍝嶅簲锛?    /// 杩欐牱鍙互绋冲畾澶嶇幇鈥渓egend 鏄犲皠閿欒瀵艰嚧楂樹寒澶辨晥鈥濈殑鍥炲綊鍦烘櫙銆?    
     fn build_minimal_session() -> LspSession {
         let (_reader_tx, reader_rx) = mpsc::channel::<ReaderMessage>();
         let mut pending_semantic_tokens = HashMap::new();
@@ -907,6 +937,7 @@ mod tests {
             semantic_token_types: vec!["type".to_string(), "function".to_string()],
             semantic_token_modifiers: vec!["declaration".to_string()],
             pending_messages: Vec::new(),
+            will_save_wait_until_supported: true,
             pending_will_save_wait_until: HashMap::new(),
             pending_completion: HashMap::new(),
             pending_semantic_tokens,
@@ -960,7 +991,7 @@ mod tests {
                 assert_eq!(tokens[0].token_type, "macro");
                 assert_eq!(tokens[0].token_modifiers, vec!["documentation"]);
             }
-            _ => panic!("杩斿洖浜嬩欢绫诲瀷閿欒锛屾湡鏈?SemanticTokens"),
+            _ => panic!("返回事件类型错误，期望 SemanticTokens"),
         }
     }
 
@@ -985,5 +1016,27 @@ mod tests {
 
         assert!(session.map_response(initialize_response).is_none());
         assert!(session.initialized);
+    }
+
+    #[test]
+    fn will_save_wait_until_unknown_request_should_disable_request() {
+        let mut session = build_minimal_session();
+        session
+            .pending_will_save_wait_until
+            .insert(9, PathBuf::from("main.rs"));
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "error": {
+                "code": -32601,
+                "message": "unknown request: textDocument/willSaveWaitUntil"
+            }
+        });
+
+        let event = session.map_response(response);
+        assert!(event.is_none());
+        assert!(!session.will_save_wait_until_supported);
+        assert!(!session.pending_will_save_wait_until.contains_key(&9));
     }
 }

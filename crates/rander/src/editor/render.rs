@@ -58,6 +58,9 @@ impl Editor {
         if self.mode == EditorMode::BufferPicker {
             self.render_buffer_picker(frame, area, palette);
         }
+        if self.mode == EditorMode::Insert && !self.completion_items.is_empty() {
+            self.render_completion_popover(frame, area, palette);
+        }
     }
 
     pub(super) fn render_tabs(&self, frame: &mut Frame, area: Rect, palette: ThemePalette) {
@@ -269,7 +272,7 @@ impl Editor {
         let mut lines = Vec::new();
         let end = min(buffer.lines.len(), buffer.scroll_row + visible);
         let is_markdown = Self::is_markdown_buffer(buffer);
-        let is_rust = Self::is_rust_buffer(buffer);
+        let lsp_language = lsp::detect_language_from_path_or_name(buffer.path.as_deref(), &buffer.name);
         let use_semantic_highlight = Self::can_use_lsp_semantic_highlight(buffer);
         let mut markdown_fence_language = if is_markdown {
             Self::markdown_fence_language_before(buffer, buffer.scroll_row)
@@ -293,21 +296,19 @@ impl Editor {
                 );
                 markdown_fence_language = next_state;
                 spans.append(&mut highlighted);
-            } else if is_rust {
-                if use_semantic_highlight {
-                    let semantic_tokens = buffer
-                        .lsp_tokens_by_line
-                        .get(&row)
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut highlighted =
-                        Self::highlight_line_with_lsp_tokens(line, &semantic_tokens, palette);
-                    spans.append(&mut highlighted);
-                } else {
-                    // Rust 语义 token 未就绪时，回退为普通文本，
-                    // 避免与“由 rust-analyzer 提供高亮”的要求相冲突。
-                    spans.push(Span::styled(line.clone(), Style::default().fg(palette.fg)));
-                }
+            } else if lsp_language.is_some() && use_semantic_highlight {
+                let semantic_tokens = buffer
+                    .lsp_tokens_by_line
+                    .get(&row)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut highlighted =
+                    Self::highlight_line_with_lsp_tokens(line, &semantic_tokens, palette);
+                spans.append(&mut highlighted);
+            } else if let Some(language) = lsp_language {
+                let mut highlighted =
+                    Self::highlight_line_with_syntect(line, language, palette);
+                spans.append(&mut highlighted);
             } else {
                 spans.push(Span::styled(line.clone(), Style::default().fg(palette.fg)));
             }
@@ -318,6 +319,8 @@ impl Editor {
         Paragraph::new(lines).render(inner, frame.buffer_mut());
 
         if focused {
+            self.last_editor_inner_area = Some(inner);
+            
             let cursor_visible_row = buffer.cursor_row.saturating_sub(buffer.scroll_row);
             if cursor_visible_row < visible {
                 // 5 列偏移：4 位行号 + 1 个空格。
@@ -362,29 +365,11 @@ impl Editor {
         name.ends_with(".md") || name.ends_with(".markdown") || name.ends_with(".mdx")
     }
 
-    /// 判断当前缓冲区是否为 Rust 文件。
-    ///
-    /// 识别规则：
-    /// - 已打开文件扩展名为 `.rs`；
-    /// - 或未落盘缓冲区名称后缀为 `.rs`。
-    fn is_rust_buffer(buffer: &EditorBuffer) -> bool {
-        let by_path = buffer.path.as_ref().and_then(|path| {
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("rs"))
-        });
-        if by_path == Some(true) {
-            return true;
-        }
-
-        buffer.name.to_ascii_lowercase().ends_with(".rs")
-    }
-
     /// 判断当前缓冲区是否适合使用 LSP 语义高亮。
     ///
-    /// 这里限定“Rust + 已有 token”两个条件：
-    /// - Rust 语义高亮由 rust-analyzer 提供，符合用户要求；
-    /// - token 未返回时回退普通文本，避免闪烁和错色。
+    /// 条件：
+    /// - 文件类型属于 LSP 支持的语言（Rust/Python/TypeScript/JavaScript等）；
+    /// - 已从 LSP 服务端获取到语义 token 数据。
     fn can_use_lsp_semantic_highlight(buffer: &EditorBuffer) -> bool {
         let is_supported_language =
             lsp::detect_language_from_path_or_name(buffer.path.as_deref(), &buffer.name).is_some();
@@ -498,6 +483,31 @@ impl Editor {
             style = style.add_modifier(Modifier::UNDERLINED);
         }
         style
+    }
+
+    /// 使用 syntect 对代码行进行语法高亮（备用方案）。
+    ///
+    /// 当 LSP 语义高亮不可用时，使用 syntect 提供基础的语法高亮。
+    fn highlight_line_with_syntect(
+        line: &str,
+        language: lsp::LspLanguage,
+        palette: ThemePalette,
+    ) -> Vec<Span<'static>> {
+        let syntect_language = match language {
+            lsp::LspLanguage::Rust => "rust",
+            lsp::LspLanguage::Python => "python",
+            lsp::LspLanguage::TypeScript => "typescript",
+            lsp::LspLanguage::JavaScript => "javascript",
+            lsp::LspLanguage::Html => "html",
+            lsp::LspLanguage::Css => "css",
+            lsp::LspLanguage::Vue => "vue",
+            lsp::LspLanguage::Java => "java",
+            lsp::LspLanguage::Go => "go",
+            lsp::LspLanguage::C => "c",
+            lsp::LspLanguage::Cpp => "cpp",
+        };
+
+        Self::highlight_fenced_code_line_with_syntect(line, syntect_language, palette)
     }
 
     /// 计算指定起始行之前的 fenced code 状态。
@@ -854,26 +864,26 @@ impl Editor {
             EditorMode::Normal => "NORMAL",
             EditorMode::Insert => "INSERT",
             EditorMode::Visual => "VISUAL",
-            EditorMode::Terminal => "TERMINAL",
+            EditorMode::Terminal => "TERM",
             EditorMode::BufferPicker => "BUFFER",
         };
+        let lsp_indicator = if self.lsp_client.is_running() { "●" } else { "○" };
         let pending = if self.normal_pending.is_empty() {
             String::new()
         } else {
-            format!(" | cmd:{}", self.normal_pending)
+            format!(" [{}]", self.normal_pending)
+        };
+        let loading = if self.lsp_loading_status.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", self.lsp_loading_status)
         };
         let text = format!(
-            "{} | theme:{}{} | lsp:{} | ra:{} | op:{} | {}",
+            " {}{}  LSP{}{}  {}",
             mode,
-            self.theme.as_str(),
             pending,
-            if self.lsp_client.is_running() {
-                "running"
-            } else {
-                "stopped"
-            },
-            self.rust_analyzer_status,
-            self.lsp_last_action,
+            lsp_indicator,
+            loading,
             self.status_message
         );
         Paragraph::new(text)
@@ -913,6 +923,135 @@ impl Editor {
 
         Paragraph::new(lines)
             .block(Block::bordered().title(" Buffers "))
+            .render(popup, frame.buffer_mut());
+    }
+
+    /// 渲染补全候选列表 popover。
+    ///
+    /// 在 INSERT 模式下，当 LSP 返回补全候选时显示浮动列表，
+    /// 支持键盘导航（上下箭头、Tab/Enter 确认）。
+    /// 最多显示 7 项，超出部分可滚动查看。
+    pub(super) fn render_completion_popover(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        palette: ThemePalette,
+    ) {
+        if self.completion_items.is_empty() {
+            return;
+        }
+
+        const COMPLETION_VISIBLE_COUNT: usize = 7;
+
+        let buffer = self.active_buffer();
+        let cursor_row = buffer.cursor_row.saturating_sub(buffer.scroll_row);
+        let cursor_col = buffer.cursor_col;
+
+        let max_width = 42u16;
+        let total_items = self.completion_items.len();
+        let visible_count = COMPLETION_VISIBLE_COUNT.min(total_items);
+        let max_height = (visible_count as u16).saturating_add(2);
+
+        let editor_inner = self.last_editor_inner_area.unwrap_or(area);
+        
+        let popup_x = editor_inner.x.saturating_add(5).saturating_add(cursor_col as u16);
+        let popup_y = editor_inner.y.saturating_add(cursor_row as u16).saturating_add(1);
+
+        let popup = Rect {
+            x: popup_x.min(editor_inner.right().saturating_sub(max_width)),
+            y: popup_y.min(editor_inner.bottom().saturating_sub(max_height)),
+            width: max_width,
+            height: max_height,
+        };
+
+        Clear.render(popup, frame.buffer_mut());
+
+        let mut lines = Vec::new();
+        let start = self.completion_scroll_offset;
+        let end = (start + visible_count).min(total_items);
+
+        for idx in start..end {
+            let item = &self.completion_items[idx];
+            let is_selected = idx == self.completion_selected;
+
+            let style = if is_selected {
+                Style::default()
+                    .bg(palette.accent)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.fg)
+            };
+
+            let label = if item.label.len() > 28 {
+                format!("{}...", &item.label[..25])
+            } else {
+                item.label.clone()
+            };
+
+            let detail_suffix = item.detail.as_ref().map(|d| {
+                let truncated = if d.len() > 12 {
+                    format!(" {}", &d[..9])
+                } else {
+                    format!(" {}", d)
+                };
+                Span::styled(truncated, Style::default().fg(palette.dim))
+            });
+
+            let mut spans = vec![Span::styled(label, style)];
+            if let Some(detail) = detail_suffix {
+                spans.push(detail);
+            }
+
+            lines.push(Line::from(spans));
+        }
+
+        let needs_scrollbar = total_items > COMPLETION_VISIBLE_COUNT;
+        let scrollbar = if needs_scrollbar {
+            let max_scroll = total_items.saturating_sub(COMPLETION_VISIBLE_COUNT);
+            let scroll_ratio = if max_scroll > 0 {
+                self.completion_scroll_offset as f32 / max_scroll as f32
+            } else {
+                0.0
+            };
+            
+            let scrollbar_height = 1.max(visible_count.saturating_sub(max_scroll.min(visible_count)));
+            let scrollbar_pos = (scroll_ratio * (visible_count.saturating_sub(scrollbar_height)) as f32) as usize;
+            
+            Some((scrollbar_pos, scrollbar_height))
+        } else {
+            None
+        };
+
+        let content_width = popup.width.saturating_sub(2) as usize;
+        let mut lines_with_scrollbar = Vec::new();
+
+        for (idx, line) in lines.into_iter().enumerate() {
+            if let Some((scrollbar_pos, scrollbar_height)) = scrollbar {
+                let has_scrollbar_char = idx >= scrollbar_pos && idx < scrollbar_pos + scrollbar_height;
+                let scroll_char = if has_scrollbar_char { "█" } else { " " };
+                
+                let mut spans = line.spans;
+                let line_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                if line_len < content_width.saturating_sub(1) {
+                    spans.push(Span::raw(" ".repeat(content_width.saturating_sub(line_len + 1))));
+                }
+                spans.push(Span::styled(
+                    scroll_char.to_string(),
+                    Style::default().fg(palette.accent),
+                ));
+                lines_with_scrollbar.push(Line::from(spans));
+            } else {
+                lines_with_scrollbar.push(line);
+            }
+        }
+
+        Paragraph::new(lines_with_scrollbar)
+            .block(
+                Block::bordered()
+                    .title(format!(" Completion ({}/{}) ", self.completion_selected + 1, total_items))
+                    .border_style(Style::default().fg(palette.accent))
+            )
             .render(popup, frame.buffer_mut());
     }
 
@@ -1224,5 +1363,186 @@ impl Editor {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lsp::LspSemanticToken;
+    use super::super::types::ThemeName;
+
+    fn test_palette() -> ThemePalette {
+        ThemePalette::from_theme(ThemeName::MaterialOcean)
+    }
+
+    #[test]
+    fn test_semantic_token_style_keyword() {
+        let token = LspSemanticToken {
+            line: 0,
+            start: 0,
+            length: 3,
+            token_type: "keyword".to_string(),
+            token_modifiers: vec![],
+        };
+        let style = Editor::semantic_token_style(&token, test_palette());
+        assert!(style.fg.is_some());
+    }
+
+    #[test]
+    fn test_semantic_token_style_function() {
+        let token = LspSemanticToken {
+            line: 0,
+            start: 0,
+            length: 5,
+            token_type: "function".to_string(),
+            token_modifiers: vec![],
+        };
+        let style = Editor::semantic_token_style(&token, test_palette());
+        assert!(style.fg.is_some());
+    }
+
+    #[test]
+    fn test_semantic_token_style_type() {
+        let token = LspSemanticToken {
+            line: 0,
+            start: 0,
+            length: 4,
+            token_type: "struct".to_string(),
+            token_modifiers: vec![],
+        };
+        let style = Editor::semantic_token_style(&token, test_palette());
+        assert!(style.fg.is_some());
+    }
+
+    #[test]
+    fn test_semantic_token_style_deprecated() {
+        let token = LspSemanticToken {
+            line: 0,
+            start: 0,
+            length: 4,
+            token_type: "function".to_string(),
+            token_modifiers: vec!["deprecated".to_string()],
+        };
+        let style = Editor::semantic_token_style(&token, test_palette());
+        assert!(style.add_modifier.contains(Modifier::CROSSED_OUT));
+    }
+
+    #[test]
+    fn test_semantic_token_style_readonly() {
+        let token = LspSemanticToken {
+            line: 0,
+            start: 0,
+            length: 4,
+            token_type: "property".to_string(),
+            token_modifiers: vec!["readonly".to_string()],
+        };
+        let style = Editor::semantic_token_style(&token, test_palette());
+        assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn test_highlight_line_with_lsp_tokens_empty() {
+        let line = "fn main() {}";
+        let tokens: Vec<LspSemanticToken> = vec![];
+        let spans = Editor::highlight_line_with_lsp_tokens(line, &tokens, test_palette());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, line);
+    }
+
+    #[test]
+    fn test_highlight_line_with_lsp_tokens_single() {
+        let line = "fn main() {}";
+        let tokens = vec![LspSemanticToken {
+            line: 0,
+            start: 0,
+            length: 2,
+            token_type: "keyword".to_string(),
+            token_modifiers: vec![],
+        }];
+        let spans = Editor::highlight_line_with_lsp_tokens(line, &tokens, test_palette());
+        assert!(spans.len() >= 2);
+        assert_eq!(spans[0].content, "fn");
+    }
+
+    #[test]
+    fn test_highlight_line_with_lsp_tokens_multiple() {
+        let line = "fn main() {}";
+        let tokens = vec![
+            LspSemanticToken {
+                line: 0,
+                start: 0,
+                length: 2,
+                token_type: "keyword".to_string(),
+                token_modifiers: vec![],
+            },
+            LspSemanticToken {
+                line: 0,
+                start: 3,
+                length: 4,
+                token_type: "function".to_string(),
+                token_modifiers: vec![],
+            },
+        ];
+        let spans = Editor::highlight_line_with_lsp_tokens(line, &tokens, test_palette());
+        assert!(spans.len() >= 3);
+    }
+
+    #[test]
+    fn test_highlight_line_with_lsp_tokens_out_of_bounds() {
+        let line = "fn";
+        let tokens = vec![LspSemanticToken {
+            line: 0,
+            start: 0,
+            length: 100,
+            token_type: "keyword".to_string(),
+            token_modifiers: vec![],
+        }];
+        let spans = Editor::highlight_line_with_lsp_tokens(line, &tokens, test_palette());
+        assert!(!spans.is_empty());
+        let combined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(combined, line);
+    }
+
+    #[test]
+    fn test_can_use_lsp_semantic_highlight_supported() {
+        let mut buffer = EditorBuffer::new_empty("test.rs".to_string());
+        buffer.path = Some(std::path::PathBuf::from("/test.rs"));
+        buffer.lsp_tokens_by_line.insert(0, vec![]);
+        assert!(Editor::can_use_lsp_semantic_highlight(&buffer));
+    }
+
+    #[test]
+    fn test_can_use_lsp_semantic_highlight_no_tokens() {
+        let mut buffer = EditorBuffer::new_empty("test.rs".to_string());
+        buffer.path = Some(std::path::PathBuf::from("/test.rs"));
+        assert!(!Editor::can_use_lsp_semantic_highlight(&buffer));
+    }
+
+    #[test]
+    fn test_can_use_lsp_semantic_highlight_unsupported_language() {
+        let mut buffer = EditorBuffer::new_empty("test.xyz".to_string());
+        buffer.path = Some(std::path::PathBuf::from("/test.xyz"));
+        buffer.lsp_tokens_by_line.insert(0, vec![]);
+        assert!(!Editor::can_use_lsp_semantic_highlight(&buffer));
+    }
+
+    #[test]
+    fn test_is_markdown_buffer_by_path() {
+        let mut buffer = EditorBuffer::new_empty("test".to_string());
+        buffer.path = Some(std::path::PathBuf::from("/test.md"));
+        assert!(Editor::is_markdown_buffer(&buffer));
+    }
+
+    #[test]
+    fn test_is_markdown_buffer_by_name() {
+        let buffer = EditorBuffer::new_empty("README.md".to_string());
+        assert!(Editor::is_markdown_buffer(&buffer));
+    }
+
+    #[test]
+    fn test_is_markdown_buffer_not_markdown() {
+        let buffer = EditorBuffer::new_empty("main.rs".to_string());
+        assert!(!Editor::is_markdown_buffer(&buffer));
     }
 }

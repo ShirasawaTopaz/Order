@@ -287,6 +287,18 @@ impl EditorBuffer {
         self.lsp_dirty = true;
     }
 
+    // 在光标位置插入字符串。
+    pub(super) fn insert_str(&mut self, s: &str) {
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let line = &mut self.lines[row];
+        let byte_idx = char_to_byte_index(line, col);
+        line.insert_str(byte_idx, s);
+        self.cursor_col += s.chars().count();
+        self.modified = true;
+        self.lsp_dirty = true;
+    }
+
     // 删除光标前字符。
     pub(super) fn backspace(&mut self) {
         if self.cursor_col > 0 {

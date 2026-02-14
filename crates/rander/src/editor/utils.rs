@@ -23,6 +23,14 @@ pub(super) fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
 
+// 判断是否允许触发补全请求的字符。
+//
+// 这里仅接受 ASCII 字母与下划线，目的是把补全请求限制在常见标识符输入场景，
+// 避免数字或符号输入时触发无效请求，减少 LSP 往返与弹窗干扰。
+pub(super) fn is_completion_trigger_char(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_'
+}
+
 // 判断坐标是否位于矩形内。
 pub(super) fn contains_point(area: Rect, x: u16, y: u16) -> bool {
     x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
@@ -107,4 +115,20 @@ pub(super) fn unescape_text(input: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_completion_trigger_char;
+
+    #[test]
+    fn test_is_completion_trigger_char() {
+        assert!(is_completion_trigger_char('a'));
+        assert!(is_completion_trigger_char('Z'));
+        assert!(is_completion_trigger_char('_'));
+
+        assert!(!is_completion_trigger_char('0'));
+        assert!(!is_completion_trigger_char('-'));
+        assert!(!is_completion_trigger_char('中'));
+    }
 }

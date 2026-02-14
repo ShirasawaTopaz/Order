@@ -50,6 +50,7 @@ pub struct Editor {
     main_focus: MainFocus,
     dragging_divider: bool,
     last_area: Option<ratatui::layout::Rect>,
+    last_editor_inner_area: Option<ratatui::layout::Rect>,
     mode: EditorMode,
     normal_pending: String,
     insert_j_pending: bool,
@@ -60,6 +61,12 @@ pub struct Editor {
     show_tagbar: bool,
     completion_items: Vec<CompletionDisplayItem>,
     completion_selected: usize,
+    completion_scroll_offset: usize,
+    /// 补全确认后的弹窗抑制开关。
+    ///
+    /// 当用户确认补全后，异步 LSP 响应可能会在短时间内返回旧候选。
+    /// 该开关用于在“下一次真实输入”前屏蔽这类回流，避免弹窗立即二次打开。
+    suppress_completion_until_input: bool,
     theme: ThemeName,
     diagnostics: Vec<String>,
     diagnostic_index: usize,
@@ -75,6 +82,10 @@ pub struct Editor {
     /// 帮助用户快速了解 editor 当前正在执行的 LSP 操作。
     lsp_last_action: String,
     rust_analyzer_status: String,
+    /// LSP 项目加载状态提示。
+    ///
+    /// 用于显示"项目加载中..."或"项目加载完成"等状态。
+    lsp_loading_status: String,
     should_exit: bool,
     last_tick: Instant,
 }
@@ -105,6 +116,7 @@ impl Editor {
             main_focus: MainFocus::Editor,
             dragging_divider: false,
             last_area: None,
+            last_editor_inner_area: None,
             mode: EditorMode::Normal,
             normal_pending: String::new(),
             insert_j_pending: false,
@@ -120,6 +132,8 @@ impl Editor {
             show_tagbar: false,
             completion_items: Vec::new(),
             completion_selected: 0,
+            completion_scroll_offset: 0,
+            suppress_completion_until_input: false,
             theme: ThemeName::MaterialOcean,
             diagnostics: vec![
                 "warning: unused variable".to_string(),
@@ -131,6 +145,7 @@ impl Editor {
             lsp_client,
             lsp_last_action: "idle".to_string(),
             rust_analyzer_status: "rust-analyzer: 未激活".to_string(),
+            lsp_loading_status: String::new(),
             should_exit: false,
             last_tick: Instant::now(),
         }
@@ -168,6 +183,18 @@ impl Editor {
             }
         }
         Ok(())
+    }
+
+    /// 标记指定语言已进入“项目加载中”阶段，并同步到状态栏提示。
+    ///
+    /// 这样做的原因是：语言服务刚启动时到首个进度事件之间存在空窗期，
+    /// 若不主动提示，用户会误以为 LSP 没有响应。
+    pub(super) fn mark_lsp_project_loading(&mut self, language: lsp::LspLanguage) {
+        self.lsp_loading_status = "项目加载中...".to_string();
+        self.status_message = format!("{} LSP 正在加载项目，请稍候...", language.display_name());
+        if language == lsp::LspLanguage::Rust {
+            self.rust_analyzer_status = "rust-analyzer: 项目加载中".to_string();
+        }
     }
 
     /// 将缓冲区中的未同步变更通过 `didChange` 推送到 LSP。
@@ -238,7 +265,11 @@ impl Editor {
                     self.apply_lsp_completion_items(&file_path, items);
                 }
                 LspEvent::SemanticTokens { file_path, tokens } => {
+                    let token_count = tokens.len();
                     self.apply_lsp_semantic_tokens(&file_path, tokens);
+                    if token_count > 0 {
+                        self.lsp_loading_status = "项目加载完成".to_string();
+                    }
                 }
                 LspEvent::RustAnalyzerStatus { message, done } => {
                     self.rust_analyzer_status = if done {
@@ -247,6 +278,11 @@ impl Editor {
                         format!("rust-analyzer: {}", message)
                     };
                     self.status_message = self.rust_analyzer_status.clone();
+                    self.lsp_loading_status = if done {
+                        "项目加载完成".to_string()
+                    } else {
+                        "项目加载中...".to_string()
+                    };
 
                     if done {
                         let tab_idx = self.active_tab;
@@ -300,6 +336,9 @@ impl Editor {
                 let buffer_language = detect_language_from_path_or_name(Some(path), "");
                 if buffer_language == Some(*language) {
                     self.try_send_did_open_for_buffer_idx(buffer_idx);
+                    if self.lsp_client.is_language_running(*language) {
+                        self.mark_lsp_project_loading(*language);
+                    }
                 } else if let Err(error) = self
                     .lsp_client
                     .ensure_started_for_language(&self.root, *language)
@@ -307,6 +346,8 @@ impl Editor {
                     self.status_message =
                         format!("{} LSP 启动失败: {error}", language.display_name());
                     continue;
+                } else {
+                    self.mark_lsp_project_loading(*language);
                 }
             } else if let Err(error) = self
                 .lsp_client
@@ -314,6 +355,8 @@ impl Editor {
             {
                 self.status_message = format!("{} LSP 启动失败: {error}", language.display_name());
                 continue;
+            } else {
+                self.mark_lsp_project_loading(*language);
             }
 
             if *language == lsp::LspLanguage::Rust {
@@ -329,7 +372,11 @@ impl Editor {
         let Some(buffer_idx) = self
             .buffers
             .iter()
-            .position(|buffer| buffer.path.as_deref() == Some(file_path))
+            .position(|buffer| {
+                buffer.path.as_ref().is_some_and(|p| {
+                    p == file_path || p.canonicalize().ok() == file_path.canonicalize().ok()
+                })
+            })
         else {
             return;
         };
@@ -338,7 +385,8 @@ impl Editor {
             buffer.lsp_completion_items = items;
         }
 
-        if buffer_idx == self.tabs[self.active_tab].buffer_index {
+        let is_active_buffer = buffer_idx == self.tabs[self.active_tab].buffer_index;
+        if is_active_buffer {
             self.refresh_completion_from_lsp_cache();
         }
     }

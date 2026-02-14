@@ -196,7 +196,7 @@ pub fn parse_semantic_tokens_from_response(
     let mut line = 0usize;
     let mut start = 0usize;
     let mut index = 0usize;
-    while index + 4 < data.len() {
+    while index + 5 <= data.len() {
         let delta_line = data[index]
             .as_u64()
             .and_then(|value| usize::try_from(value).ok())
@@ -354,8 +354,20 @@ pub fn parse_text_edits_from_response(value: &Value) -> Vec<LspTextEdit> {
 
 /// 将本地路径转换为 `file://` URI。
 pub fn path_to_file_uri(path: &Path) -> Result<String> {
-    let absolute = path.canonicalize().context("规范化路径失败")?;
-    let display = absolute.to_string_lossy().replace('\\', "/");
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("获取当前目录失败")?
+            .join(path)
+    };
+    
+    let mut display = absolute.to_string_lossy().replace('\\', "/");
+    
+    // 移除 Windows 扩展长度路径前缀
+    if display.starts_with("//?/") {
+        display = display[4..].to_string();
+    }
 
     if display.chars().nth(1) == Some(':') {
         Ok(format!("file:///{}", display))
@@ -371,12 +383,42 @@ pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     }
     let mut path = uri.trim_start_matches("file://").to_string();
 
+    // URL 解码
+    if let Ok(decoded) = urlencoding_decode(&path) {
+        path = decoded;
+    }
+
     // Windows `file:///C:/...` 会得到 `/C:/...`，需要去掉开头斜杠。
     if path.starts_with('/') && path.chars().nth(2) == Some(':') {
         path.remove(0);
     }
 
     Some(PathBuf::from(path))
+}
+
+/// 简单的 URL 解码实现。
+fn urlencoding_decode(s: &str) -> Result<String, ()> {
+    let mut result = String::new();
+    let mut chars = s.chars().peekable();
+    
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if hex.len() == 2 {
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    result.push(byte as char);
+                    continue;
+                }
+            }
+            return Err(());
+        } else if c == '+' {
+            result.push(' ');
+        } else {
+            result.push(c);
+        }
+    }
+    
+    Ok(result)
 }
 
 /// 计算 `old_text` 到 `new_text` 的增量变更集合。

@@ -14,10 +14,38 @@ use super::{
         CompletionDisplayItem, EditorBuffer, EditorMode, MainFocus, PaneFocus, SplitDirection,
         TabState,
     },
-    utils::{contains_point, file_name_or, is_normal_command_prefix},
+    utils::{
+        contains_point, file_name_or, is_completion_trigger_char, is_normal_command_prefix,
+    },
 };
 
+const COMPLETION_VISIBLE_COUNT: usize = 7;
+
 impl Editor {
+    /// 清理补全弹窗状态。
+    ///
+    /// 将“候选列表 + 选中索引 + 滚动偏移”一并重置，避免后续按键复用到旧状态。
+    fn clear_completion_state(&mut self) {
+        self.completion_items.clear();
+        self.completion_selected = 0;
+        self.completion_scroll_offset = 0;
+    }
+
+    /// 标记“补全已确认”，进入弹窗短暂抑制期。
+    ///
+    /// 这么做是为了吸收确认补全后可能晚到的异步候选更新，
+    /// 防止补全窗口在用户刚确认时立即重新出现。
+    fn suppress_completion_until_next_input(&mut self) {
+        self.suppress_completion_until_input = true;
+    }
+
+    /// 解除补全抑制期。
+    ///
+    /// 仅在用户发生新的编辑输入时解除，保证补全窗口的再次出现是用户主动触发。
+    fn resume_completion_after_input(&mut self) {
+        self.suppress_completion_until_input = false;
+    }
+
     pub(super) fn handle_key_event(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
@@ -262,11 +290,15 @@ impl Editor {
     pub(super) fn handle_insert_key_event(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.mode = EditorMode::Normal;
                 self.insert_j_pending = false;
-                self.status_message = "NORMAL".to_string();
-                self.completion_items.clear();
-                self.completion_selected = 0;
+                if !self.completion_items.is_empty() {
+                    // 补全弹窗可见时，优先关闭弹窗，避免误退出 INSERT 模式。
+                    self.clear_completion_state();
+                } else {
+                    self.mode = EditorMode::Normal;
+                    self.status_message = "NORMAL".to_string();
+                    self.clear_completion_state();
+                }
             }
             KeyCode::Char('k') if self.insert_j_pending => {
                 // `jk` 作为 INSERT 模式退出快捷键：
@@ -276,15 +308,20 @@ impl Editor {
                 self.mode = EditorMode::Normal;
                 self.insert_j_pending = false;
                 self.status_message = "NORMAL".to_string();
-                self.completion_items.clear();
-                self.completion_selected = 0;
+                self.clear_completion_state();
             }
             KeyCode::Char(ch) => {
+                self.resume_completion_after_input();
                 self.insert_j_pending = ch == 'j';
                 self.active_buffer_mut().insert_char(ch);
-                self.refresh_completion();
+                if is_completion_trigger_char(ch) {
+                    self.refresh_completion_with_request();
+                } else {
+                    self.clear_completion_state();
+                }
             }
             KeyCode::Backspace => {
+                self.resume_completion_after_input();
                 self.insert_j_pending = false;
                 self.active_buffer_mut().backspace();
                 self.refresh_completion();
@@ -293,17 +330,17 @@ impl Editor {
                 self.insert_j_pending = false;
                 if !self.completion_items.is_empty() {
                     self.accept_completion();
-                    self.refresh_completion();
                 } else {
+                    self.resume_completion_after_input();
                     self.active_buffer_mut().insert_newline();
                     self.refresh_completion();
                 }
             }
             KeyCode::Tab => {
                 if !self.completion_items.is_empty() {
-                    self.accept_completion();
-                    self.refresh_completion();
+                    self.select_next_completion();
                 } else {
+                    self.resume_completion_after_input();
                     for _ in 0..4 {
                         self.active_buffer_mut().insert_char(' ');
                     }
@@ -791,9 +828,39 @@ impl Editor {
 
     // 刷新自动补全候选列表。
     pub(super) fn refresh_completion(&mut self) {
-        // 先消费上一次 LSP 返回结果刷新 UI，再异步请求下一轮补全。
         self.refresh_completion_from_lsp_cache();
-        self.request_completion_for_active_buffer();
+    }
+
+    /// 刷新补全并请求新的补全候选。
+    ///
+    /// 仅在光标前是补全触发字符（`a-z`/`A-Z`/`_`）时发送请求。
+    pub(super) fn refresh_completion_with_request(&mut self) {
+        self.refresh_completion_from_lsp_cache();
+
+        if self.should_request_completion() {
+            self.request_completion_for_active_buffer();
+        }
+    }
+
+    /// 判断是否应该请求补全。
+    ///
+    /// 仅当光标前是补全触发字符（`a-z`/`A-Z`/`_`）时才请求补全，
+    /// 避免数字、符号或空格导致无效请求。
+    fn should_request_completion(&self) -> bool {
+        let buffer = self.active_buffer();
+        let line = buffer.lines.get(buffer.cursor_row);
+
+        if let Some(line) = line {
+            let chars: Vec<char> = line.chars().collect();
+            if buffer.cursor_col > 0 {
+                let prev_char = chars.get(buffer.cursor_col - 1);
+                if let Some(&ch) = prev_char {
+                    return is_completion_trigger_char(ch);
+                }
+            }
+        }
+
+        false
     }
 
     /// 切换到上一个补全候选。
@@ -803,13 +870,20 @@ impl Editor {
     fn select_prev_completion(&mut self) {
         if self.completion_items.is_empty() {
             self.completion_selected = 0;
+            self.completion_scroll_offset = 0;
             return;
         }
 
+        let max_index = self.completion_items.len().saturating_sub(1);
+
         if self.completion_selected == 0 {
-            self.completion_selected = self.completion_items.len().saturating_sub(1);
+            self.completion_selected = max_index;
+            self.completion_scroll_offset = max_index.saturating_sub(COMPLETION_VISIBLE_COUNT - 1);
         } else {
             self.completion_selected = self.completion_selected.saturating_sub(1);
+            if self.completion_selected < self.completion_scroll_offset {
+                self.completion_scroll_offset = self.completion_selected;
+            }
         }
     }
 
@@ -819,9 +893,24 @@ impl Editor {
     fn select_next_completion(&mut self) {
         if self.completion_items.is_empty() {
             self.completion_selected = 0;
+            self.completion_scroll_offset = 0;
             return;
         }
-        self.completion_selected = (self.completion_selected + 1) % self.completion_items.len();
+
+        let max_index = self.completion_items.len().saturating_sub(1);
+
+        if self.completion_selected >= max_index {
+            self.completion_selected = 0;
+            self.completion_scroll_offset = 0;
+        } else {
+            self.completion_selected += 1;
+            let visible_end = self.completion_scroll_offset + COMPLETION_VISIBLE_COUNT - 1;
+            if self.completion_selected > visible_end {
+                self.completion_scroll_offset = self
+                    .completion_selected
+                    .saturating_sub(COMPLETION_VISIBLE_COUNT - 1);
+            }
+        }
     }
 
     /// 基于 buffer 缓存中的 LSP 补全项刷新展示列表。
@@ -829,27 +918,33 @@ impl Editor {
     /// 这里按“当前前缀 + insert_text/label”做一次轻过滤，
     /// 再按 insert_text 去重，避免服务端返回大量重复候选导致补全 popover 噪声过高。
     pub(super) fn refresh_completion_from_lsp_cache(&mut self) {
-        let Some((_, _, prefix)) = self.active_buffer().word_prefix() else {
-            self.completion_items.clear();
-            self.completion_selected = 0;
-            return;
-        };
-        if prefix.is_empty() {
-            self.completion_items.clear();
-            self.completion_selected = 0;
+        if self.suppress_completion_until_input {
+            self.clear_completion_state();
             return;
         }
 
+        let buffer = self.active_buffer();
+        let prefix_opt = buffer.word_prefix();
+        let prefix_str = prefix_opt.as_ref().map(|(_, _, p)| p.as_str()).unwrap_or("");
+
+        let prefix_lower = prefix_str.to_lowercase();
         let mut candidates: BTreeMap<String, CompletionDisplayItem> = BTreeMap::new();
-        for item in &self.active_buffer().lsp_completion_items {
+        for item in &buffer.lsp_completion_items {
             let insert_text = item
                 .insert_text
                 .as_deref()
                 .unwrap_or(item.label.as_str())
                 .to_string();
             let label = item.label.clone();
-            let matched = (insert_text.starts_with(&prefix) && insert_text != prefix)
-                || (label.starts_with(&prefix) && label != prefix);
+
+            let matched = if prefix_str.is_empty() {
+                true
+            } else {
+                let insert_lower = insert_text.to_lowercase();
+                let label_lower = label.to_lowercase();
+                insert_lower.starts_with(&prefix_lower) || label_lower.starts_with(&prefix_lower)
+            };
+
             if !matched {
                 continue;
             }
@@ -862,7 +957,6 @@ impl Editor {
             candidates
                 .entry(insert_text)
                 .and_modify(|existing| {
-                    // 优先保留带 detail 的候选，便于 popover 展示更多上下文。
                     if existing.detail.is_none() && display.detail.is_some() {
                         existing.detail = display.detail.clone();
                     }
@@ -873,20 +967,29 @@ impl Editor {
         self.completion_items = candidates.into_values().take(20).collect();
         if self.completion_selected >= self.completion_items.len() {
             self.completion_selected = 0;
+            self.completion_scroll_offset = 0;
         }
     }
 
     fn request_completion_for_active_buffer(&mut self) {
         let buffer_idx = self.tabs[self.active_tab].buffer_index;
-        let Some((path, cursor_row, cursor_col)) =
-            self.buffers.get(buffer_idx).and_then(|buffer| {
-                let path = buffer.path.as_ref()?.clone();
-                Some((path, buffer.cursor_row, buffer.cursor_col))
-            })
-        else {
-            // 未落盘缓冲区无法生成稳定 URI，暂不触发 LSP 补全。
+        let Some(path) = self.buffers.get(buffer_idx).and_then(|buffer| buffer.path.clone()) else {
             return;
         };
+
+        let cursor_row = self.buffers[buffer_idx].cursor_row;
+        let cursor_col = self.buffers[buffer_idx].cursor_col;
+
+        if let Err(error) = self.lsp_client.ensure_started_for_file(&self.root, &path) {
+            self.status_message = format!("LSP 启动失败: {error}");
+            return;
+        }
+
+        let lsp_running = self.lsp_client.is_running();
+        if !lsp_running {
+            self.status_message = "补全请求: LSP 未运行".to_string();
+            return;
+        }
 
         if let Err(error) = self
             .lsp_client
@@ -902,20 +1005,25 @@ impl Editor {
             return;
         }
 
+        if self.completion_selected >= self.completion_items.len() {
+            return;
+        }
+
         let selected = self.completion_items[self.completion_selected].clone();
         let choice = if selected.insert_text.is_empty() {
-            selected.label
+            selected.label.clone()
         } else {
-            selected.insert_text
+            selected.insert_text.clone()
         };
 
         if let Some((start, end, _)) = self.active_buffer().word_prefix() {
             self.active_buffer_mut().replace_prefix(start, end, &choice);
+        } else {
+            self.active_buffer_mut().insert_str(&choice);
         }
 
-        // 接受补全后立即清空候选，避免旧数据在下一次输入前残留。
-        self.completion_items.clear();
-        self.completion_selected = 0;
+        self.clear_completion_state();
+        self.suppress_completion_until_next_input();
     }
 
     pub(super) fn new_tab(&mut self) {
@@ -1026,13 +1134,24 @@ impl Editor {
         }) else {
             return;
         };
+        // 记录发送 didOpen 前的运行态，用于判断本次是否触发了语言服务冷启动。
+        // 只有冷启动场景才展示“项目加载中”提示，避免在日常文件切换时反复打扰。
+        let language = lsp::detect_language_from_path_or_name(Some(&path), "");
+        let started_from_cold = language
+            .is_some_and(|detected| !self.lsp_client.is_language_running(detected));
 
         match self
             .lsp_client
             .send_did_open(&self.root, &path, &text, version)
         {
             Ok(_) => {
-                self.status_message = format!("已打开：{}（LSP didOpen 已发送）", path.display());
+                if let Some(detected) = language
+                    && started_from_cold
+                {
+                    self.mark_lsp_project_loading(detected);
+                } else {
+                    self.status_message = format!("已打开：{}（LSP didOpen 已发送）", path.display());
+                }
                 if let Some(buffer_mut) = self.buffers.get_mut(buffer_idx) {
                     buffer_mut.lsp_dirty = false;
                     buffer_mut.lsp_last_synced_text = Some(text);
@@ -1194,5 +1313,65 @@ impl Editor {
             message = message.chars().take(180).collect::<String>() + "…";
         }
         self.status_message = message;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::super::types::{CompletionDisplayItem, EditorMode};
+    use super::Editor;
+
+    #[test]
+    fn test_insert_esc_closes_completion_before_leave_insert() {
+        let mut editor = Editor::new(PathBuf::from("."));
+        editor.mode = EditorMode::Insert;
+        editor.completion_items = vec![CompletionDisplayItem {
+            label: "alpha".to_string(),
+            insert_text: "alpha".to_string(),
+            detail: None,
+        }];
+        editor.completion_selected = 3;
+        editor.completion_scroll_offset = 2;
+
+        editor.handle_insert_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(editor.mode, EditorMode::Insert);
+        assert!(editor.completion_items.is_empty());
+        assert_eq!(editor.completion_selected, 0);
+        assert_eq!(editor.completion_scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_accept_completion_closes_popup_until_next_input() {
+        let mut editor = Editor::new(PathBuf::from("."));
+        editor.mode = EditorMode::Insert;
+        editor.active_buffer_mut().insert_str("fo");
+        editor.active_buffer_mut().lsp_completion_items = vec![lsp::LspCompletionItem {
+            label: "foo".to_string(),
+            insert_text: Some("foo".to_string()),
+            detail: None,
+        }];
+        editor.completion_items = vec![CompletionDisplayItem {
+            label: "foo".to_string(),
+            insert_text: "foo".to_string(),
+            detail: None,
+        }];
+        editor.completion_selected = 0;
+
+        editor.handle_insert_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(editor.completion_items.is_empty());
+        assert!(editor.suppress_completion_until_input);
+
+        // 模拟补全确认后又收到一次候选刷新，窗口应保持关闭。
+        editor.refresh_completion_from_lsp_cache();
+        assert!(editor.completion_items.is_empty());
+
+        editor.handle_insert_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(!editor.suppress_completion_until_input);
     }
 }

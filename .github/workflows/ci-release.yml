@@ -1,0 +1,123 @@
+name: CI And Release
+
+on:
+  # 对主分支和版本标签都运行，确保发布前至少经过一次同样的校验流程。
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  # PR 阶段只做质量校验，不触发发布，避免未合并代码产生 release。
+  pull_request:
+  # 保留手动触发入口，便于紧急情况下重跑流水线。
+  workflow_dispatch:
+
+# 避免同一分支/标签被重复构建，减少资源浪费和并发发布冲突。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust Dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Rustfmt Check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy Check
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Unit Tests
+        run: cargo test --workspace --all-targets
+
+  build_artifacts:
+    name: Build Artifacts (${{ matrix.os }})
+    needs: verify
+    # 只有推送版本标签时才打包发布产物，日常 push/PR 不做发布构建。
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust Dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Release Binary
+        run: cargo build --release -p order
+
+      - name: Package Release Artifact
+        shell: pwsh
+        run: |
+          # 统一按标签和平台命名，便于用户在 Release 页面快速识别可下载文件。
+          $binaryName = "order"
+          if ("${{ runner.os }}" -eq "Windows") {
+            $binaryName = "order.exe"
+          }
+
+          $sourceBinary = Join-Path "target/release" $binaryName
+          $packageName = "order-${{ github.ref_name }}-${{ runner.os }}-${{ runner.arch }}"
+
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+
+          if ("${{ runner.os }}" -eq "Windows") {
+            $archivePath = "dist/$packageName.zip"
+            Compress-Archive -Path $sourceBinary -DestinationPath $archivePath -Force
+          } else {
+            $archivePath = "dist/$packageName.tar.gz"
+            tar -czf $archivePath -C "target/release" $binaryName
+          }
+
+          Add-Content -Path $env:GITHUB_ENV -Value "ASSET_PATH=$archivePath"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: order-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ env.ASSET_PATH }}
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build_artifacts
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      # 创建 release 与上传附件需要 contents:write。
+      contents: write
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/**/*.zip
+            dist/**/*.tar.gz
