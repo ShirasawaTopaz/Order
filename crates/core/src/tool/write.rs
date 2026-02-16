@@ -54,22 +54,21 @@ impl Tool for WriteTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "写入工作区内文件内容（高风险：默认不直接落盘，会生成预览并要求用户二次确认；默认将 CRLF 规范为 LF）"
-                .to_string(),
+            description: "Stage a workspace file change for approval (high risk: does not write to disk immediately). For code edit requests, always call this tool directly and do NOT ask for write permission in chat first; approval is handled by the TUI via /approve or /reject after staging.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "相对路径（基于当前工作区根目录），例如 `crates/core/src/lib.rs`"
+                        "description": "Workspace-relative file path, for example `crates/core/src/lib.rs`."
                     },
                     "content": {
                         "type": "string",
-                        "description": "要写入的文本内容（UTF-8）"
+                        "description": "Text content to write (UTF-8)."
                     },
                     "append": {
                         "type": "boolean",
-                        "description": "为 true 时追加；为 false 时覆盖（默认 false）"
+                        "description": "When true append to file; when false replace file content (default false)."
                     }
                 },
                 "required": ["path", "content"]
@@ -94,11 +93,11 @@ impl Tool for WriteTool {
 
         let append = args.append.unwrap_or(false);
 
-        // 统一将 CRLF 规范为 LF，减少跨平台协作时的 diff 噪音。
+        // 统一将 CRLF 规范为 LF，避免跨平台协作时出现无意义换行差异。
         let content = args.content.replace("\r\n", "\n");
         if content.as_bytes().len() > MAX_WRITE_BYTES {
             let result: Result<String, WriteToolError> = Err(WriteToolError::Other(format!(
-                "写入内容过大（{} bytes），已拒绝写入；请拆分或提高上限",
+                "write content too large ({} bytes), refusing write; split content or increase limit",
                 content.as_bytes().len()
             )));
 
@@ -121,7 +120,9 @@ impl Tool for WriteTool {
 
         let result: Result<String, WriteToolError> = (|| {
             let trace_id = trace_id.as_ref().ok_or_else(|| {
-                WriteToolError::Other("缺少 trace_id：无法进入安全写入确认流程".to_string())
+                WriteToolError::Other(
+                    "missing trace_id: cannot enter safe write approval flow".to_string(),
+                )
             })?;
 
             let guard = ExecutionGuard::default();
@@ -129,18 +130,19 @@ impl Tool for WriteTool {
                 .stage_write(trace_id, &args.path, &content, append)
                 .map_err(|error| WriteToolError::Other(error.to_string()))?;
 
-            Err(WriteToolError::Other(format!(
-                "高风险写入已拦截（未落盘）。\n\
+            // 暂存成功必须返回 Ok，避免模型把“待审批写入”误判为失败并退化成纯口头承诺。
+            Ok(format!(
+                "Staged high-risk write (not written to disk yet).\n\
 trace_id: {trace_id}\n\
 path: {}\n\
 append: {}\n\
 diff: existed={} old_lines={} new_lines={} +{} -{}\n\
 \n\
-请在 TUI 中执行：\n\
-- `/approve {trace_id}` 确认写入（将自动创建快照，必要时可回滚）\n\
-- `/reject {trace_id}` 取消本次写入\n\
+Run in TUI:\n\
+- `/approve {trace_id}` to apply writes (snapshot will be created automatically)\n\
+- `/reject {trace_id}` to discard staged writes\n\
 \n\
-确认写入后，如需回滚：`/rollback {trace_id}`",
+After approval, rollback if needed: `/rollback {trace_id}`",
                 summary.path,
                 summary.append,
                 summary.diff.existed,
@@ -148,7 +150,7 @@ diff: existed={} old_lines={} new_lines={} +{} -{}\n\
                 summary.diff.new_lines,
                 summary.diff.added_lines,
                 summary.diff.removed_lines
-            )))
+            ))
         })();
 
         if let Some(ref trace_id) = trace_id {

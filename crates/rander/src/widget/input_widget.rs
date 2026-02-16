@@ -22,6 +22,10 @@ pub const AVAILABLE_COMMANDS: &[(&str, &str)] = &[
     ("/rules", "Edit project rules"),
     ("/settings", "Configure settings"),
     ("/status", "Check system status"),
+    (
+        "/capability",
+        "Capability cache reset; usage: /capability reset ...",
+    ),
     ("/editor", "Open Order-editor"),
 ];
 

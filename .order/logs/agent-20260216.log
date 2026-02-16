@@ -1,0 +1,10 @@
+{"event":"tui_input","ts":"2026-02-16T14:27:45.186751600+08:00","trace_id":"6992b8e19582da80","input_len":914}
+{"event":"tool_call_start","ts":"2026-02-16T14:27:46.690918900+08:00","trace_id":"6992b8e19582da80","tool":"SearchFileTool"}
+{"event":"tool_call_end","ts":"2026-02-16T14:27:46.849915700+08:00","trace_id":"6992b8e19582da80","tool":"SearchFileTool","ok":true,"duration_ms":159,"error":null}
+{"event":"tool_call_start","ts":"2026-02-16T14:27:48.542898400+08:00","trace_id":"6992b8e19582da80","tool":"ReadTool"}
+{"event":"tool_call_end","ts":"2026-02-16T14:27:48.544544600+08:00","trace_id":"6992b8e19582da80","tool":"ReadTool","ok":true,"duration_ms":1,"error":null}
+{"event":"tool_call_start","ts":"2026-02-16T14:27:50.108998300+08:00","trace_id":"6992b8e19582da80","tool":"ReadTool"}
+{"event":"tool_call_end","ts":"2026-02-16T14:27:50.111418400+08:00","trace_id":"6992b8e19582da80","tool":"ReadTool","ok":true,"duration_ms":2,"error":null}
+{"event":"tui_output","ts":"2026-02-16T14:27:56.105174800+08:00","trace_id":"6992b8e19582da80","ok":true,"output_len":562,"error":null}
+{"event":"tui_input","ts":"2026-02-16T14:28:05.714924800+08:00","trace_id":"6992b8f52a9cbb281","input_len":1}
+{"event":"tui_output","ts":"2026-02-16T14:28:21.159916900+08:00","trace_id":"6992b8f52a9cbb281","ok":true,"output_len":2366,"error":null}

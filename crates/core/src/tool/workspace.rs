@@ -87,6 +87,38 @@ pub fn resolve_workspace_relative_path(root: &Path, user_path: &str) -> Result<P
     Ok(resolved)
 }
 
+/// 将工作区内绝对路径格式化为“可直接回填给工具调用”的相对路径字符串。
+///
+/// 设计取舍：
+/// - 统一使用 `/` 作为分隔符，避免 Windows 下 `\` 在提示词中被误当作转义字符；
+/// - 输出保持工作区相对语义，便于模型把搜索结果直接传给 `ReadTool/WriteTool`。
+pub fn format_workspace_relative_path(root: &Path, path: &Path) -> Result<String, String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| format!("路径不在工作区内: {}", path.display()))?;
+
+    let mut segments = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(segment) => segments.push(segment.to_string_lossy().into_owned()),
+            // 已经 strip_prefix 到工作区内后，不应再出现绝对语义；出现则视为异常输入。
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "路径包含非法组件，无法格式化为工作区相对路径: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    if segments.is_empty() {
+        return Ok(".".to_string());
+    }
+
+    Ok(segments.join("/"))
+}
+
 /// 校验从工作区根目录到目标路径的“已存在节点”是否包含符号链接。
 ///
 /// 这样做是为了防止通过工作区内的符号链接跳转到工作区外部文件系统。
@@ -118,4 +150,31 @@ pub fn ensure_no_symlink_in_existing_path(root: &Path, resolved: &Path) -> Resul
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::format_workspace_relative_path;
+
+    #[test]
+    fn format_workspace_relative_path_should_use_forward_slashes() {
+        let root = Path::new("D:/order");
+        let file = Path::new("D:/order/crates/core/src/lib.rs");
+
+        let formatted = format_workspace_relative_path(root, file)
+            .expect("path inside workspace should be formattable");
+        assert_eq!(formatted, "crates/core/src/lib.rs");
+    }
+
+    #[test]
+    fn format_workspace_relative_path_should_reject_outside_path() {
+        let root = Path::new("D:/order");
+        let file = Path::new("D:/another/file.rs");
+
+        let error = format_workspace_relative_path(root, file)
+            .expect_err("path outside workspace should be rejected");
+        assert!(error.contains("路径不在工作区内"));
+    }
 }

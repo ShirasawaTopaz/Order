@@ -10,13 +10,14 @@ use core::{
     commands::{EXIT, get_exit},
     encoding::{read_utf8_text_with_report, write_utf8_text_with_report},
     model::{
+        capabilities::CapabilityResolver,
         connection::{Connection, ModelStreamEvent, Provider},
         info::{get_current_model_info, get_current_model_info_from_config},
     },
     observability::{
         AgentEvent, log_event_best_effort, new_trace_id, ts, workspace_root_best_effort,
     },
-    safety::ExecutionGuard,
+    safety::{ExecutionGuard, PendingWriteSummary},
     validation::ValidationPipeline,
 };
 use crossterm::{
@@ -30,7 +31,7 @@ use rig::completion::Message as RigMessage;
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -47,7 +48,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Paragraph, Widget},
+    widgets::{Block, Clear, Paragraph, Widget},
 };
 
 /// 对话消息角色。
@@ -168,6 +169,43 @@ struct ActiveCompletion {
     started_at: Instant,
 }
 
+const WRITE_APPROVAL_OPTIONS: [&str; 3] = ["1. 同意", "2. 不同意", "3. 同意之后一切修改"];
+/// 当识别为“代码变更请求”时，附加到发送给模型的执行约束提示。
+///
+/// 目标是把“先口头确认再行动”改为“直接工具执行 + TUI 审批写入”。
+const EXECUTION_ENFORCER_SUFFIX: &str = r#"
+
+[执行约束]
+这是代码变更请求。请直接执行：
+1. 先调用 SearchFileTool/ReadTool 定位并确认目标代码。
+2. 需要改动时直接调用 WriteTool 暂存变更，不要在聊天里先请求“允许写入”。
+3. 写入审批由系统通过 /approve /reject 处理，你只需完成工具调用与结果说明。
+4. 若首次写入失败，请报告错误并继续尝试可行替代，不要只给计划。"#;
+/// 当检测到“代码请求但未执行工具”时，附加的补偿提示。
+///
+/// 用于在同一请求内自动纠偏，避免模型连续输出“会继续执行”却不落盘。
+const EXECUTION_RETRY_SUFFIX: &str = r#"
+
+[强制执行补偿]
+上一轮没有实际工具执行。此轮必须：
+1. 至少调用一次 SearchFileTool 或 ReadTool 确认目标代码；
+2. 再调用 WriteTool 暂存改动；
+3. 不允许只回复计划或承诺语句。"#;
+/// 当请求明确要求“写入/改动代码”时，附加的写入硬约束。
+const WRITE_EXECUTION_ENFORCER_SUFFIX: &str = r#"
+
+[写入硬约束]
+本请求要求实际改动代码。你必须至少调用一次 WriteTool 暂存补丁；
+若未调用 WriteTool，本轮输出将被判定为失败并自动重试。"#;
+
+/// 待确认写入的交互菜单状态。
+#[derive(Debug, Clone)]
+struct WriteApprovalPrompt {
+    trace_id: String,
+    selected: usize,
+    files: Vec<String>,
+}
+
 pub struct OrderTui<'a> {
     /// 全局退出标记。
     exit: &'a AtomicBool,
@@ -208,6 +246,16 @@ pub struct OrderTui<'a> {
     last_failure: Option<FailureSummary>,
     /// 当前是否存在正在执行的流式请求。
     active_completion: Option<ActiveCompletion>,
+    /// 写入确认菜单状态；有值时输入会被菜单优先消费。
+    write_approval_prompt: Option<WriteApprovalPrompt>,
+    /// 会话级“自动同意后续所有写入”开关。
+    approve_all_writes: bool,
+    /// 当前是否已开启鼠标捕获。
+    ///
+    /// 在 Windows 控制台中，未初始化就直接执行 `DisableMouseCapture`
+    /// 会触发 `Initial console modes not set`，因此这里显式跟踪状态，
+    /// 只在“确实开启过”时再关闭。
+    mouse_capture_enabled: bool,
 }
 
 impl Default for OrderTui<'_> {
@@ -227,14 +275,17 @@ impl Default for OrderTui<'_> {
             conversation_scroll: 0,
             last_failure: None,
             active_completion: None,
+            write_approval_prompt: None,
+            approve_all_writes: false,
+            mouse_capture_enabled: false,
         }
     }
 }
 
 impl OrderTui<'_> {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
-        // 启用鼠标捕获，主界面和 editor 会共享鼠标事件能力。
-        execute!(std::io::stdout(), EnableMouseCapture)?;
+        // 主对话界面默认不启用鼠标捕获，优先保证“可直接框选历史文本进行复制”。
+        // 注意：这里不能无条件执行 DisableMouseCapture，Windows 下未初始化时会报错。
 
         // 先渲染一次主界面，避免启动阶段的 Codex 探测阻塞导致黑屏。
         terminal.draw(|frame| self.draw(frame))?;
@@ -283,8 +334,23 @@ impl OrderTui<'_> {
             }
         }
 
-        execute!(std::io::stdout(), DisableMouseCapture)?;
+        self.set_mouse_capture(false)?;
         terminal.clear()?;
+        Ok(())
+    }
+
+    /// 统一管理鼠标捕获状态，避免重复/非法切换导致控制台报错。
+    fn set_mouse_capture(&mut self, enabled: bool) -> anyhow::Result<()> {
+        if self.mouse_capture_enabled == enabled {
+            return Ok(());
+        }
+
+        if enabled {
+            execute!(std::io::stdout(), EnableMouseCapture)?;
+        } else {
+            execute!(std::io::stdout(), DisableMouseCapture)?;
+        }
+        self.mouse_capture_enabled = enabled;
         Ok(())
     }
 
@@ -438,6 +504,12 @@ impl OrderTui<'_> {
             return;
         }
 
+        // 写入确认菜单是强交互状态：必须先完成同意/拒绝决策，避免输入误发到主对话。
+        if self.write_approval_prompt.is_some() {
+            self.handle_write_approval_key_event(key);
+            return;
+        }
+
         // 若当前处于历史选择界面，优先消费历史浏览相关按键。
         if self.history_browser.is_some() {
             self.handle_history_browser_key_event(key);
@@ -510,7 +582,67 @@ impl OrderTui<'_> {
         }
     }
 
+    /// 处理“写入确认菜单”的按键事件。
+    ///
+    /// 交互约束：
+    /// - 仅支持 `Up` / `Down` / `Enter`，与需求中的方向键 + 回车保持一致；
+    /// - `Enter` 会立刻执行对应动作，确保决策可追踪且不悬空。
+    fn handle_write_approval_key_event(&mut self, key: &KeyEvent) {
+        // 保留全局退出快捷键，避免菜单态下出现“无法退出”的死锁体验。
+        if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.exit.store(true, Ordering::Relaxed);
+            return;
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                if let Some(prompt) = self.write_approval_prompt.as_mut() {
+                    if prompt.selected == 0 {
+                        prompt.selected = WRITE_APPROVAL_OPTIONS.len().saturating_sub(1);
+                    } else {
+                        prompt.selected = prompt.selected.saturating_sub(1);
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if let Some(prompt) = self.write_approval_prompt.as_mut() {
+                    prompt.selected = (prompt.selected + 1) % WRITE_APPROVAL_OPTIONS.len();
+                }
+            }
+            KeyCode::Enter => {
+                let Some(prompt) = self.write_approval_prompt.take() else {
+                    return;
+                };
+                match prompt.selected {
+                    0 => {
+                        self.approve_pending_writes_by_trace_id(&prompt.trace_id);
+                    }
+                    1 => {
+                        self.reject_pending_writes_by_trace_id(&prompt.trace_id);
+                    }
+                    2 => {
+                        self.approve_all_writes = true;
+                        self.push_chat_message(
+                            ChatRole::Llm,
+                            "已开启“同意之后一切修改”（仅本次会话生效）".to_string(),
+                            false,
+                        );
+                        self.approve_pending_writes_by_trace_id(&prompt.trace_id);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// 处理鼠标事件。
+    ///
+    /// 说明：
+    /// - 主对话界面默认关闭鼠标捕获以支持文本框选复制；
+    /// - 当启用鼠标捕获（例如 editor 场景）时，仍可复用本逻辑处理滚动。
     ///
     /// 支持操作：
     /// - 鼠标滚轮向上：向上滚动对话区
@@ -696,70 +828,7 @@ impl OrderTui<'_> {
                     );
                     return Ok(());
                 };
-
-                let guard = ExecutionGuard::default();
-                match guard.apply_pending_writes(trace_id) {
-                    Ok(result) => {
-                        self.push_chat_message(
-                            ChatRole::Llm,
-                            format!(
-                                "已确认写入（trace_id={}），影响文件数={}：\n{}",
-                                result.trace_id,
-                                result.files.len(),
-                                result
-                                    .files
-                                    .iter()
-                                    .map(|path| format!("- {path}"))
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            ),
-                            false,
-                        );
-
-                        // 确认写入后自动跑最小验证闭环，并把结果归档到 `.order/reports/<trace_id>/validation.json`。
-                        let pipeline = ValidationPipeline::default();
-                        match pipeline.run(trace_id, &result.files) {
-                            Ok(report) => {
-                                if report.ok {
-                                    self.push_chat_message(
-                                        ChatRole::Llm,
-                                        format!(
-                                            "自动验证通过（耗时={}ms）。报告已写入 `.order/reports/{}/validation.json`",
-                                            report.duration_ms, report.trace_id
-                                        ),
-                                        false,
-                                    );
-                                } else {
-                                    self.push_chat_message(
-                                        ChatRole::Error,
-                                        format!(
-                                            "自动验证失败（耗时={}ms）。失败命令：{}\n报告已写入 `.order/reports/{}/validation.json`\n{}",
-                                            report.duration_ms,
-                                            report.failed_command.clone().unwrap_or_else(|| "<unknown>".to_string()),
-                                            report.trace_id,
-                                            report.suggestion.clone().unwrap_or_default()
-                                        ),
-                                        false,
-                                    );
-                                }
-                            }
-                            Err(error) => {
-                                self.push_chat_message(
-                                    ChatRole::Error,
-                                    format!("自动验证执行失败：{error}"),
-                                    false,
-                                );
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        self.push_chat_message(
-                            ChatRole::Error,
-                            format!("确认写入失败：{error}"),
-                            false,
-                        );
-                    }
-                }
+                self.approve_pending_writes_by_trace_id(trace_id);
             }
             "/reject" => {
                 let Some(trace_id) = segments.next() else {
@@ -770,20 +839,7 @@ impl OrderTui<'_> {
                     );
                     return Ok(());
                 };
-
-                let guard = ExecutionGuard::default();
-                match guard.reject_pending_writes(trace_id) {
-                    Ok(()) => self.push_chat_message(
-                        ChatRole::Llm,
-                        format!("已取消待确认写入：trace_id={trace_id}"),
-                        false,
-                    ),
-                    Err(error) => self.push_chat_message(
-                        ChatRole::Error,
-                        format!("取消待确认写入失败：{error}"),
-                        false,
-                    ),
-                }
+                self.reject_pending_writes_by_trace_id(trace_id);
             }
             "/rollback" => {
                 let guard = ExecutionGuard::default();
@@ -837,6 +893,15 @@ impl OrderTui<'_> {
                             false,
                         ),
                     },
+                }
+            }
+            "/capability" => {
+                if let Err(error) = self.handle_capability_command(&mut segments) {
+                    self.push_chat_message(
+                        ChatRole::Error,
+                        format!("能力缓存操作失败：{error}"),
+                        false,
+                    );
                 }
             }
             "/status" => {
@@ -925,6 +990,181 @@ impl OrderTui<'_> {
         }
 
         Ok(())
+    }
+
+    /// 执行待确认写入的“同意”动作，并在成功后触发最小验证。
+    ///
+    /// 返回值语义：
+    /// - `true`：写入已落盘（验证失败不影响该结果）；
+    /// - `false`：写入未落盘。
+    fn approve_pending_writes_by_trace_id(&mut self, trace_id: &str) -> bool {
+        if self
+            .write_approval_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.trace_id == trace_id)
+        {
+            self.write_approval_prompt = None;
+        }
+
+        let guard = ExecutionGuard::default();
+        match guard.apply_pending_writes(trace_id) {
+            Ok(result) => {
+                self.push_chat_message(
+                    ChatRole::Llm,
+                    format!(
+                        "已确认写入（trace_id={}），影响文件数={}：\n{}",
+                        result.trace_id,
+                        result.files.len(),
+                        result
+                            .files
+                            .iter()
+                            .map(|path| format!("- {path}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ),
+                    false,
+                );
+
+                // 确认写入后自动跑最小验证闭环，并把结果归档到 `.order/reports/<trace_id>/validation.json`。
+                let pipeline = ValidationPipeline::default();
+                match pipeline.run(trace_id, &result.files) {
+                    Ok(report) => {
+                        if report.ok {
+                            self.push_chat_message(
+                                ChatRole::Llm,
+                                format!(
+                                    "自动验证通过（耗时={}ms）。报告已写入 `.order/reports/{}/validation.json`",
+                                    report.duration_ms, report.trace_id
+                                ),
+                                false,
+                            );
+                        } else {
+                            self.push_chat_message(
+                                ChatRole::Error,
+                                format!(
+                                    "自动验证失败（耗时={}ms）。失败命令：{}\n报告已写入 `.order/reports/{}/validation.json`\n{}",
+                                    report.duration_ms,
+                                    report.failed_command.clone().unwrap_or_else(|| "<unknown>".to_string()),
+                                    report.trace_id,
+                                    report.suggestion.clone().unwrap_or_default()
+                                ),
+                                false,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        self.push_chat_message(
+                            ChatRole::Error,
+                            format!("自动验证执行失败：{error}"),
+                            false,
+                        );
+                    }
+                }
+                true
+            }
+            Err(error) => {
+                self.push_chat_message(ChatRole::Error, format!("确认写入失败：{error}"), false);
+                false
+            }
+        }
+    }
+
+    /// 执行待确认写入的“拒绝”动作。
+    fn reject_pending_writes_by_trace_id(&mut self, trace_id: &str) -> bool {
+        if self
+            .write_approval_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.trace_id == trace_id)
+        {
+            self.write_approval_prompt = None;
+        }
+
+        let guard = ExecutionGuard::default();
+        match guard.reject_pending_writes(trace_id) {
+            Ok(()) => {
+                self.push_chat_message(
+                    ChatRole::Llm,
+                    format!("已取消待确认写入：trace_id={trace_id}"),
+                    false,
+                );
+                true
+            }
+            Err(error) => {
+                self.push_chat_message(
+                    ChatRole::Error,
+                    format!("取消待确认写入失败：{error}"),
+                    false,
+                );
+                false
+            }
+        }
+    }
+
+    /// 请求结束后检查 pending write，并按当前策略决定是弹菜单还是自动同意。
+    fn refresh_write_approval_prompt_after_request(&mut self, trace_id: &str) {
+        let guard = ExecutionGuard::default();
+        let summaries = match guard.list_pending_writes(trace_id) {
+            Ok(items) => items,
+            Err(error) => {
+                self.push_chat_message(
+                    ChatRole::Error,
+                    format!("读取待确认写入失败：{error}"),
+                    false,
+                );
+                return;
+            }
+        };
+
+        if summaries.is_empty() {
+            return;
+        }
+
+        if self.approve_all_writes {
+            self.push_chat_message(
+                ChatRole::Llm,
+                format!(
+                    "检测到待确认写入（trace_id={}，文件数={}），已按“同意之后一切修改”自动确认。",
+                    trace_id,
+                    summaries.len()
+                ),
+                false,
+            );
+            if self.approve_pending_writes_by_trace_id(trace_id) {
+                return;
+            }
+
+            // 自动确认失败时回落到手动模式，避免持续失败却无可操作入口。
+            self.approve_all_writes = false;
+            self.push_chat_message(
+                ChatRole::Error,
+                "自动同意失败，已回退为手动确认模式".to_string(),
+                false,
+            );
+        }
+
+        self.open_write_approval_prompt(trace_id, summaries);
+    }
+
+    /// 打开写入确认菜单，并带上本次写入的文件摘要。
+    fn open_write_approval_prompt(&mut self, trace_id: &str, summaries: Vec<PendingWriteSummary>) {
+        let files = summaries
+            .iter()
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>();
+        self.write_approval_prompt = Some(WriteApprovalPrompt {
+            trace_id: trace_id.to_string(),
+            selected: 0,
+            files,
+        });
+        self.push_chat_message(
+            ChatRole::Llm,
+            format!(
+                "检测到待确认写入（trace_id={}，文件数={}）。请使用 ↑/↓ 选择并按 Enter 确认。",
+                trace_id,
+                summaries.len()
+            ),
+            false,
+        );
     }
 
     /// 生成/更新模型配置：优先尝试 Codex。
@@ -1062,6 +1302,7 @@ impl OrderTui<'_> {
             model_name.to_string(),
             false,
             None,
+            None,
         );
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1088,6 +1329,8 @@ impl OrderTui<'_> {
     /// 写入模型配置文件（UTF-8 JSON + LF）。
     ///
     /// 目前固定写到 `.order/model.json`，并启用 `support_tools`，让 Codex 更像“编码助手”。
+    ///
+    /// 同时写入 `default_max_turns`，让用户可直接通过配置调节工具多轮上限。
     fn write_model_config_file(
         &self,
         config_path: &PathBuf,
@@ -1110,7 +1353,8 @@ impl OrderTui<'_> {
                 "support_tools": true,
                 "model_max_context": 0,
                 "model_max_output": 0,
-                "model_max_tokens": 0
+                "model_max_tokens": 0,
+                "default_max_turns": 12
             },
             "models": []
         });
@@ -1140,6 +1384,9 @@ impl OrderTui<'_> {
     fn start_streaming_completion(&mut self, prompt: String) -> anyhow::Result<()> {
         self.ensure_connection()?;
         let chat_history = self.build_chat_history_for_llm(&prompt);
+        let enforce_tool_execution = Self::looks_like_code_change_request(&prompt);
+        let require_write_tool = Self::should_require_write_tool(&prompt);
+        let request_prompt = Self::prepare_request_prompt(&prompt, require_write_tool);
         let connection = self
             .connection
             .as_ref()
@@ -1169,7 +1416,9 @@ impl OrderTui<'_> {
         Self::spawn_completion_worker(
             connection,
             trace_id.clone(),
-            prompt,
+            request_prompt,
+            enforce_tool_execution,
+            require_write_tool,
             chat_history,
             sender,
             cancel_flag.clone(),
@@ -1194,6 +1443,8 @@ impl OrderTui<'_> {
         mut connection: Connection,
         trace_id: String,
         prompt: String,
+        enforce_tool_execution: bool,
+        require_write_tool: bool,
         history: Vec<RigMessage>,
         sender: Sender<CompletionWorkerEvent>,
         cancel_flag: Arc<AtomicBool>,
@@ -1216,6 +1467,8 @@ impl OrderTui<'_> {
                 &mut connection,
                 trace_id,
                 prompt,
+                enforce_tool_execution,
+                require_write_tool,
                 history,
                 sender.clone(),
                 cancel_flag,
@@ -1231,6 +1484,8 @@ impl OrderTui<'_> {
         connection: &mut Connection,
         trace_id: String,
         prompt: String,
+        enforce_tool_execution: bool,
+        require_write_tool: bool,
         history: Vec<RigMessage>,
         sender: Sender<CompletionWorkerEvent>,
         cancel_flag: Arc<AtomicBool>,
@@ -1245,18 +1500,33 @@ impl OrderTui<'_> {
 
             let emitted_delta = Arc::new(AtomicBool::new(false));
             let emitted_delta_for_stream = emitted_delta.clone();
+            let emitted_tool_progress = Arc::new(AtomicBool::new(false));
+            let emitted_tool_progress_for_stream = emitted_tool_progress.clone();
+            let emitted_write_tool = Arc::new(AtomicBool::new(false));
+            let emitted_write_tool_for_stream = emitted_write_tool.clone();
             let sender_for_stream = sender.clone();
+            let request_prompt = if enforce_tool_execution && attempt > 1 {
+                format!("{prompt}{EXECUTION_RETRY_SUFFIX}")
+            } else {
+                prompt.clone()
+            };
 
             let result = tokio::time::timeout(
                 Duration::from_secs(REQUEST_TIMEOUT_SECS),
                 connection.response_with_history_streamed_traced(
                     trace_id.clone(),
-                    prompt.clone(),
+                    request_prompt,
                     history.clone(),
                     cancel_flag.as_ref(),
                     move |event| {
                         if matches!(event, ModelStreamEvent::Delta { .. }) {
                             emitted_delta_for_stream.store(true, Ordering::Relaxed);
+                        }
+                        if let ModelStreamEvent::ToolProgress { message } = &event {
+                            emitted_tool_progress_for_stream.store(true, Ordering::Relaxed);
+                            if message.contains("WriteTool") {
+                                emitted_write_tool_for_stream.store(true, Ordering::Relaxed);
+                            }
                         }
                         let _ = sender_for_stream.send(CompletionWorkerEvent::Stream(event));
                     },
@@ -1265,7 +1535,49 @@ impl OrderTui<'_> {
             .await;
 
             let error_message = match result {
-                Ok(Ok(_)) => return Ok(()),
+                Ok(Ok(response)) => {
+                    let tool_called = emitted_tool_progress.load(Ordering::Relaxed);
+                    let write_tool_called = emitted_write_tool.load(Ordering::Relaxed);
+                    let missed_tool_execution = enforce_tool_execution && !tool_called;
+                    let missed_write_execution = require_write_tool && !write_tool_called;
+
+                    if missed_tool_execution || missed_write_execution {
+                        if attempt < MAX_ATTEMPTS {
+                            let reason = if missed_write_execution {
+                                "未调用 WriteTool"
+                            } else {
+                                "未执行任何工具调用"
+                            };
+                            let delay = Self::retry_backoff_with_jitter(attempt);
+                            let _ = sender.send(CompletionWorkerEvent::Stream(
+                                ModelStreamEvent::ToolProgress {
+                                    message: format!(
+                                        "第 {attempt} 次回复{reason}，将在 {}ms 后强制重试",
+                                        delay.as_millis()
+                                    ),
+                                },
+                            ));
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+
+                        let fallback_hint = if Self::is_non_executing_commitment_response(&response.content) {
+                            "（检测到承诺式文本）"
+                        } else {
+                            ""
+                        };
+                        return Err(anyhow!(
+                            "模型未满足执行约束{}：{}",
+                            fallback_hint,
+                            if missed_write_execution {
+                                "本轮未调用 WriteTool 暂存补丁"
+                            } else {
+                                "本轮未触发任何工具调用"
+                            }
+                        ));
+                    }
+                    return Ok(());
+                }
                 Ok(Err(error)) => error.to_string(),
                 Err(_) => format!("请求超时（>{REQUEST_TIMEOUT_SECS}s）"),
             };
@@ -1309,34 +1621,161 @@ impl OrderTui<'_> {
             || normalized.contains("cancel")
     }
 
+    /// 构造实际发送给模型的请求文本。
+    ///
+    /// 仅当识别为“代码变更请求”时追加执行约束，避免影响普通问答体验。
+    fn prepare_request_prompt(prompt: &str, require_write_tool: bool) -> String {
+        if Self::looks_like_code_change_request(prompt) {
+            if require_write_tool {
+                return format!(
+                    "{prompt}{EXECUTION_ENFORCER_SUFFIX}{WRITE_EXECUTION_ENFORCER_SUFFIX}"
+                );
+            }
+            return format!("{prompt}{EXECUTION_ENFORCER_SUFFIX}");
+        }
+        prompt.to_string()
+    }
+
+    /// 识别输入是否属于“应直接落代码”的请求。
+    ///
+    /// 这是启发式检测：宁可多命中少量问答，也要避免在明确改码需求下再次退化为口头承诺。
+    fn looks_like_code_change_request(prompt: &str) -> bool {
+        let normalized = prompt.to_ascii_lowercase();
+        let keywords = [
+            "修复", "实现", "修改", "改动", "新增", "重构", "补丁", "写入文件", "改代码",
+            "fix", "implement", "modify", "refactor", "patch", "write", "edit",
+            "code", "bug", ".rs", "crates/", "cargo", "todo.md",
+        ];
+        keywords
+            .iter()
+            .any(|keyword| prompt.contains(keyword) || normalized.contains(keyword))
+    }
+
+    /// 判断该请求是否明确要求“实际写入代码补丁”。
+    fn should_require_write_tool(prompt: &str) -> bool {
+        let normalized = prompt.to_ascii_lowercase();
+        [
+            "写入",
+            "补丁",
+            "改代码",
+            "改文件",
+            "直接改",
+            "落盘",
+            "修复",
+            "实现",
+            "修改",
+            "write patch",
+            "apply patch",
+            "edit file",
+            "fix",
+            "implement",
+            "modify",
+        ]
+        .iter()
+        .any(|keyword| prompt.contains(keyword) || normalized.contains(keyword))
+    }
+
+    /// 判断回复是否属于“无执行结果的承诺性文本”。
+    ///
+    /// 用于代码请求自动纠偏：若未出现工具调用且回复仅是承诺语句，则触发强制重试。
+    fn is_non_executing_commitment_response(response: &str) -> bool {
+        let normalized = response.to_ascii_lowercase();
+        let has_commitment = [
+            "我会",
+            "我将",
+            "下一步",
+            "开始写补丁",
+            "继续执行",
+            "已收到同意",
+            "还没真正调用",
+            "I will",
+            "next step",
+            "not yet called",
+        ]
+        .iter()
+        .any(|keyword| response.contains(keyword) || normalized.contains(keyword));
+        if !has_commitment {
+            return false;
+        }
+
+        // 一旦包含明确执行痕迹（文件路径、测试命令、trace_id、写入状态），就不视为“空话”。
+        ![
+            ".rs",
+            ".toml",
+            "crates/",
+            "trace_id=",
+            "Staged high-risk write",
+            "cargo test",
+            "cargo check",
+            "已修改",
+            "已写入",
+            "已完成",
+        ]
+        .iter()
+        .any(|keyword| response.contains(keyword) || normalized.contains(keyword))
+    }
+
     /// 判断错误是否可重试（网络抖动、限流、网关瞬时故障等）。
     fn is_retryable_stream_error(error: &str) -> bool {
         if Self::is_cancelled_completion_error(error) {
             return false;
         }
         let normalized = error.to_ascii_lowercase();
+        if Self::extract_retryable_http_status(&normalized).is_some() {
+            return true;
+        }
 
         [
             "timeout",
             "timed out",
-            "429",
             "rate limit",
             "connection reset",
             "connection refused",
             "broken pipe",
             "temporarily unavailable",
+            "internal server error",
             "service unavailable",
             "gateway timeout",
             "bad gateway",
-            "502",
-            "503",
-            "504",
             "network",
             "dns",
             "transport",
         ]
         .iter()
         .any(|keyword| normalized.contains(keyword))
+    }
+
+    /// 从错误文案中提取“可重试”的 HTTP 状态码。
+    ///
+    /// 只在常见状态字段附近解析数字，避免被 trace_id 这类无关数字误判触发重试。
+    fn extract_retryable_http_status(normalized_error: &str) -> Option<u16> {
+        const RETRYABLE_STATUS_CODES: [u16; 6] = [408, 429, 500, 502, 503, 504];
+        for marker in ["status code", "status=", "\"status\":", "http "] {
+            let Some(code) = Self::extract_status_after_marker(normalized_error, marker) else {
+                continue;
+            };
+            if RETRYABLE_STATUS_CODES.contains(&code) {
+                return Some(code);
+            }
+        }
+        None
+    }
+
+    /// 在指定 marker 之后提取连续数字状态码。
+    ///
+    /// 这里限定为 3 位数字，确保只匹配标准 HTTP 状态码。
+    fn extract_status_after_marker(normalized_error: &str, marker: &str) -> Option<u16> {
+        let index = normalized_error.find(marker)?;
+        let suffix = normalized_error.get(index + marker.len()..)?;
+        let digits = suffix
+            .chars()
+            .skip_while(|ch| !ch.is_ascii_digit())
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if digits.len() != 3 {
+            return None;
+        }
+        digits.parse::<u16>().ok()
     }
 
     /// 计算指数退避 + 抖动延迟，避免并发失败时重试风暴。
@@ -1431,6 +1870,7 @@ impl OrderTui<'_> {
             return;
         };
 
+        let trace_id = active.trace_id.clone();
         let workspace_root = workspace_root_best_effort();
         let output_len = self
             .messages
@@ -1463,7 +1903,7 @@ impl OrderTui<'_> {
                     &workspace_root,
                     AgentEvent::TuiOutput {
                         ts: ts(),
-                        trace_id: active.trace_id.clone(),
+                        trace_id: trace_id.clone(),
                         ok: true,
                         output_len,
                         error: None,
@@ -1481,22 +1921,19 @@ impl OrderTui<'_> {
                     );
                     self.push_chat_message(
                         ChatRole::Llm,
-                        format!("已取消当前请求（trace_id={}）", active.trace_id),
+                        format!("已取消当前请求（trace_id={}）", trace_id),
                         false,
                     );
                     self.last_failure = None;
                 } else {
                     let reason = shorten_reason(&error_message, 80);
                     self.last_failure = Some(FailureSummary {
-                        trace_id: active.trace_id.clone(),
+                        trace_id: trace_id.clone(),
                         reason: reason.clone(),
                     });
                     self.push_chat_message(
                         ChatRole::Error,
-                        format!(
-                            "发送失败（trace_id={}）：{}",
-                            active.trace_id, error_message
-                        ),
+                        format!("发送失败（trace_id={}）：{}", trace_id, error_message),
                         false,
                     );
                 }
@@ -1505,7 +1942,7 @@ impl OrderTui<'_> {
                     &workspace_root,
                     AgentEvent::TuiOutput {
                         ts: ts(),
-                        trace_id: active.trace_id,
+                        trace_id: trace_id.clone(),
                         ok: false,
                         output_len: None,
                         error: Some(shorten_reason(&error_message, 80)),
@@ -1513,6 +1950,8 @@ impl OrderTui<'_> {
                 );
             }
         }
+
+        self.refresh_write_approval_prompt_after_request(&trace_id);
     }
 
     /// 发起取消信号；真正结束由后台线程回传 `Completed` 事件统一收尾。
@@ -2002,6 +2441,12 @@ impl OrderTui<'_> {
             model_info.token,
             model_info.model_name,
             model_info.support_tools,
+            // 约定：配置值为 0 表示“使用系统默认上限”，避免每次都必须显式填写。
+            if model_info.default_max_turns > 0 {
+                Some(model_info.default_max_turns as usize)
+            } else {
+                None
+            },
             model_info.capabilities,
         ));
 
@@ -2242,16 +2687,290 @@ impl OrderTui<'_> {
                 failure.trace_id, failure.reason
             ));
         }
+        let approval_mode = if self.approve_all_writes {
+            "自动同意（本会话）"
+        } else {
+            "手动确认"
+        };
+        summary.push_str(&format!("\n写入同意策略：{approval_mode}"));
         summary.push_str(&format!("\n日志目录：{}", logs_dir.display()));
+        if let Err(error) = self.append_capability_status_summary(&mut summary, &workspace_root) {
+            summary.push_str(&format!("\n能力诊断失败：{error}"));
+        }
 
         self.push_chat_message(ChatRole::Llm, summary, false);
         Ok(())
     }
 
+    /// 处理能力缓存命令。
+    ///
+    /// 支持：
+    /// - `/capability reset`：重置当前模型对应缓存；
+    /// - `/capability reset all`：清空全部能力缓存；
+    /// - `/capability reset <provider>`：按 provider 清理；
+    /// - `/capability reset <provider> <model>`：按 provider + model 精确清理。
+    fn handle_capability_command<'a>(
+        &mut self,
+        segments: &mut std::str::SplitWhitespace<'a>,
+    ) -> anyhow::Result<()> {
+        let Some(subcommand) = segments.next() else {
+            self.push_chat_message(
+                ChatRole::Error,
+                "用法：/capability reset [all|<provider>|<provider> <model>]".to_string(),
+                false,
+            );
+            return Ok(());
+        };
+
+        if !subcommand.eq_ignore_ascii_case("reset") {
+            self.push_chat_message(ChatRole::Error, "仅支持子命令：reset".to_string(), false);
+            return Ok(());
+        }
+
+        let args = segments.collect::<Vec<_>>();
+        if args.len() > 2 {
+            self.push_chat_message(
+                ChatRole::Error,
+                "用法：/capability reset [all|<provider>|<provider> <model>]".to_string(),
+                false,
+            );
+            return Ok(());
+        }
+
+        let mut provider_filter: Option<String> = None;
+        let mut model_filter: Option<String> = None;
+        match args.as_slice() {
+            [] => {
+                let Some(current) = get_current_model_info()? else {
+                    self.push_chat_message(
+                        ChatRole::Error,
+                        "当前未检测到模型配置，无法推断要重置的 provider/model".to_string(),
+                        false,
+                    );
+                    return Ok(());
+                };
+                provider_filter = Some(current.provider_name);
+                model_filter = Some(current.model_name);
+            }
+            [one] if one.eq_ignore_ascii_case("all") => {}
+            [provider] => {
+                provider_filter = Some((*provider).to_string());
+            }
+            [provider, model] => {
+                provider_filter = Some((*provider).to_string());
+                model_filter = Some((*model).to_string());
+            }
+            _ => {}
+        }
+
+        let resolver = CapabilityResolver::default();
+        let workspace_root = workspace_root_best_effort();
+        let removed = resolver.reset_cache_entries(
+            &workspace_root,
+            provider_filter.as_deref(),
+            model_filter.as_deref(),
+        )?;
+        log_event_best_effort(
+            &workspace_root,
+            AgentEvent::CapabilityCacheReset {
+                ts: ts(),
+                provider: provider_filter.clone(),
+                model: model_filter.clone(),
+                removed,
+            },
+        );
+
+        let provider_label = provider_filter.unwrap_or_else(|| "*".to_string());
+        let model_label = model_filter.unwrap_or_else(|| "*".to_string());
+        self.push_chat_message(
+            ChatRole::Llm,
+            format!(
+                "能力缓存重置完成：provider={} model={}，已移除 {} 条记录",
+                provider_label, model_label, removed
+            ),
+            false,
+        );
+        Ok(())
+    }
+
+    /// 将“当前生效能力 + 最近缓存降级原因”拼接到 `/status` 输出中。
+    fn append_capability_status_summary(
+        &self,
+        summary: &mut String,
+        workspace_root: &Path,
+    ) -> anyhow::Result<()> {
+        let Some(model_info) = get_current_model_info()? else {
+            summary.push_str("\n当前能力：未检测到模型配置");
+            summary.push_str("\n降级缓存：未命中");
+            return Ok(());
+        };
+
+        let provider = Self::parse_provider(model_info.provider_name.as_str())?;
+        let api_url = model_info.api_url.trim();
+        let api_url = if api_url.is_empty() {
+            None
+        } else {
+            Some(api_url)
+        };
+
+        let resolver = CapabilityResolver::default();
+        let negotiated = resolver.resolve(
+            workspace_root,
+            provider,
+            api_url,
+            &model_info.model_name,
+            model_info.support_tools,
+            model_info.capabilities.as_ref(),
+        )?;
+        let enabled = |value: bool| if value { "on" } else { "off" };
+        summary.push_str(&format!(
+            "\n当前能力：endpoint={} tools={} stream={} system_preamble={} sources={}",
+            negotiated.endpoint.as_str(),
+            enabled(negotiated.tools_enabled),
+            enabled(negotiated.stream_enabled),
+            enabled(negotiated.system_preamble_enabled),
+            negotiated.sources.join(",")
+        ));
+
+        if let Some(snapshot) = resolver.inspect_cache_entry(
+            workspace_root,
+            provider,
+            api_url,
+            &model_info.model_name,
+        )? {
+            let state = if snapshot.expired {
+                "expired"
+            } else {
+                "active"
+            };
+            let reason = snapshot
+                .reason
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let ttl = snapshot
+                .remaining_ttl_seconds
+                .map(|seconds| format!("{seconds}s"))
+                .unwrap_or_else(|| "0s".to_string());
+            summary.push_str(&format!(
+                "\n降级缓存：state={} source={} reason={} confidence={:.2} ttl={} first_seen={} last_seen={}",
+                state,
+                snapshot.source.as_str(),
+                reason,
+                snapshot.confidence,
+                ttl,
+                snapshot.first_seen_at,
+                snapshot.last_seen_at
+            ));
+        } else {
+            summary.push_str("\n降级缓存：未命中");
+        }
+
+        Ok(())
+    }
+
+    /// 在主界面上方渲染写入确认菜单。
+    ///
+    /// 采用弹层而不是普通消息的原因：
+    /// - 该交互属于“需要立即决策”的阻断点；
+    /// - 明确的焦点态能降低误输入到主对话框的风险。
+    fn render_write_approval_prompt(&self, area: Rect, buf: &mut Buffer) {
+        let Some(prompt) = self.write_approval_prompt.as_ref() else {
+            return;
+        };
+
+        let max_width = area.width.saturating_sub(2);
+        let max_height = area.height.saturating_sub(2);
+        if max_width < 24 || max_height < 8 {
+            return;
+        }
+
+        let width = max_width.min(78);
+        let preview_count = prompt.files.len().min(3);
+        let mut height = 11 + preview_count as u16;
+        if prompt.files.len() > preview_count {
+            height = height.saturating_add(1);
+        }
+        height = height.min(max_height);
+
+        let popup = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+
+        Clear.render(popup, buf);
+
+        let block = Block::bordered()
+            .title(" 写入确认 ")
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(popup);
+        block.render(popup, buf);
+
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let mut lines = vec![
+            Line::from(format!("trace_id: {}", prompt.trace_id)),
+            Line::from(format!("待确认文件数: {}", prompt.files.len())),
+            Line::from(""),
+            Line::from("文件预览："),
+        ];
+
+        for file in prompt.files.iter().take(preview_count) {
+            lines.push(Line::from(format!("- {file}")));
+        }
+        if prompt.files.len() > preview_count {
+            lines.push(Line::from(format!(
+                "... 还有 {} 个文件",
+                prompt.files.len() - preview_count
+            )));
+        }
+
+        lines.push(Line::from(""));
+
+        for (index, option) in WRITE_APPROVAL_OPTIONS.iter().enumerate() {
+            let selected = index == prompt.selected;
+            let prefix = if selected { ">" } else { " " };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{prefix} {option}"),
+                style,
+            )));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "↑/↓ 选择，Enter 确认",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let max_lines = inner.height as usize;
+        if lines.len() > max_lines {
+            lines.truncate(max_lines);
+        }
+
+        Paragraph::new(Text::from(lines)).render(inner, buf);
+    }
+
     /// 进入 editor 子界面，退出后回到主界面。
     fn launch_editor(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
+        // editor 依赖鼠标拖拽与滚轮交互，因此进入 editor 前临时开启鼠标捕获。
+        self.set_mouse_capture(true)?;
         let mut editor = Editor::default();
-        editor.run(terminal)?;
+        let run_result = editor.run(terminal);
+        // 返回主界面后恢复“可框选文本”的默认行为。
+        let restore_result = self.set_mouse_capture(false);
+        restore_result?;
+        run_result?;
         terminal.clear()?;
         self.last_tick = Instant::now();
         Ok(())
@@ -2394,7 +3113,72 @@ mod tests {
         assert!(OrderTui::is_retryable_stream_error(
             "transport error: connection reset by peer"
         ));
+        assert!(OrderTui::is_retryable_stream_error(
+            "CompletionError: ProviderError: Invalid status code 500 Internal Server Error"
+        ));
         assert!(!OrderTui::is_retryable_stream_error("401 unauthorized"));
+        assert!(!OrderTui::is_retryable_stream_error(
+            "CompletionError: ProviderError: Invalid status code 400 Bad Request"
+        ));
+    }
+
+    #[test]
+    fn extract_retryable_http_status_should_only_accept_retryable_codes() {
+        assert_eq!(
+            OrderTui::extract_retryable_http_status(
+                "completionerror: providererror: invalid status code 500 internal server error"
+            ),
+            Some(500)
+        );
+        assert_eq!(
+            OrderTui::extract_retryable_http_status("http 429 too many requests"),
+            Some(429)
+        );
+        assert_eq!(
+            OrderTui::extract_retryable_http_status("invalid status code 400 bad request"),
+            None
+        );
+    }
+
+    #[test]
+    fn prepare_request_prompt_should_append_enforcer_for_code_change_request() {
+        let prompt = "请修复 connection.rs 里的重试逻辑";
+        let prepared = OrderTui::prepare_request_prompt(prompt, true);
+        assert!(prepared.starts_with(prompt));
+        assert!(prepared.contains("[执行约束]"));
+        assert!(prepared.contains("WriteTool"));
+        assert!(prepared.contains("[写入硬约束]"));
+    }
+
+    #[test]
+    fn prepare_request_prompt_should_keep_plain_prompt_for_non_code_request() {
+        let prompt = "帮我总结今天的开发进度";
+        let prepared = OrderTui::prepare_request_prompt(prompt, false);
+        assert_eq!(prepared, prompt);
+    }
+
+    #[test]
+    fn should_require_write_tool_should_match_patch_intent() {
+        assert!(OrderTui::should_require_write_tool(
+            "请直接写入补丁并修改 connection.rs"
+        ));
+        assert!(!OrderTui::should_require_write_tool(
+            "请解释一下当前架构设计"
+        ));
+    }
+
+    #[test]
+    fn is_non_executing_commitment_response_should_detect_empty_commitment() {
+        assert!(OrderTui::is_non_executing_commitment_response(
+            "已收到同意。我下一步会继续执行，还没真正调用 WriteTool。"
+        ));
+    }
+
+    #[test]
+    fn is_non_executing_commitment_response_should_allow_real_execution_output() {
+        assert!(!OrderTui::is_non_executing_commitment_response(
+            "已写入 crates/core/src/observability.rs，trace_id=abc123，后续将执行 cargo test。"
+        ));
     }
 
     #[test]
@@ -2407,6 +3191,70 @@ mod tests {
         assert!((600..=800).contains(&attempt1));
         assert!((1200..=1600).contains(&attempt2));
         assert!((2400..=3200).contains(&attempt3));
+    }
+
+    #[test]
+    fn write_approval_prompt_should_support_up_down_wrap_navigation() {
+        let mut tui = OrderTui::default();
+        tui.write_approval_prompt = Some(WriteApprovalPrompt {
+            trace_id: "trace-1".to_string(),
+            selected: 0,
+            files: vec!["a.rs".to_string()],
+        });
+
+        tui.handle_key_event(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            tui.write_approval_prompt
+                .as_ref()
+                .expect("prompt should keep visible")
+                .selected,
+            WRITE_APPROVAL_OPTIONS.len() - 1
+        );
+
+        tui.handle_key_event(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            tui.write_approval_prompt
+                .as_ref()
+                .expect("prompt should keep visible")
+                .selected,
+            0
+        );
+    }
+
+    #[test]
+    fn write_approval_prompt_enter_on_reject_should_not_enable_approve_all() {
+        let mut tui = OrderTui::default();
+        tui.write_approval_prompt = Some(WriteApprovalPrompt {
+            trace_id: "trace-2".to_string(),
+            selected: 1,
+            files: vec!["b.rs".to_string()],
+        });
+
+        tui.handle_key_event(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(tui.write_approval_prompt.is_none());
+        assert!(!tui.approve_all_writes);
+    }
+
+    #[test]
+    fn write_approval_prompt_enter_on_approve_all_should_enable_session_flag() {
+        let mut tui = OrderTui::default();
+        tui.write_approval_prompt = Some(WriteApprovalPrompt {
+            trace_id: "trace-3".to_string(),
+            selected: 2,
+            files: vec!["c.rs".to_string()],
+        });
+
+        tui.handle_key_event(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(tui.write_approval_prompt.is_none());
+        assert!(tui.approve_all_writes);
+        assert!(
+            tui.messages
+                .iter()
+                .any(|item| item.content.contains("同意之后一切修改")),
+            "应给出已开启会话级自动同意的提示"
+        );
     }
 }
 
@@ -2454,6 +3302,7 @@ impl Widget for &OrderTui<'_> {
                 widget.set_status_message(message.clone());
             }
             widget.clone().render(input_area, buf);
+            self.render_write_approval_prompt(main_area, buf);
             return;
         }
 
@@ -2499,6 +3348,7 @@ impl Widget for &OrderTui<'_> {
                 widget.set_status_message(message.clone());
             }
             widget.clone().render(input_area, buf);
+            self.render_write_approval_prompt(main_area, buf);
             return;
         }
 
@@ -2554,6 +3404,10 @@ impl Widget for &OrderTui<'_> {
             ("/rules", "Edit project rules"),
             ("/settings", "Configure settings"),
             ("/status", "Check system status"),
+            (
+                "/capability",
+                "Capability cache reset; usage: /capability reset ...",
+            ),
             ("/editor", "Open Order-editor"),
         ];
 
@@ -2577,5 +3431,6 @@ impl Widget for &OrderTui<'_> {
             widget.set_status_message(message.clone());
         }
         widget.clone().render(input_area, buf);
+        self.render_write_approval_prompt(main_area, buf);
     }
 }

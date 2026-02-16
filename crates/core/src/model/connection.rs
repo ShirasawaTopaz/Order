@@ -1,4 +1,5 @@
 use std::{
+    path::Path,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -21,8 +22,12 @@ use rig::{
     streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat},
 };
 
-use super::capabilities::{
-    CapabilityResolver, ModelEndpoint, NegotiatedCapabilities, ProviderCapabilitiesOverride,
+use super::{
+    capabilities::{
+        CapabilityResolver, CapabilityWritebackContext, ModelEndpoint, NegotiatedCapabilities,
+        ProviderCapabilities, ProviderCapabilitiesOverride,
+    },
+    fallback::{CapabilityFallbackPlan, ClassifiedError, ErrorClassifier, RequestFeatureFlags},
 };
 use crate::observability::{
     AgentEvent, log_event_best_effort, ts, with_trace_id, workspace_root_best_effort,
@@ -31,8 +36,34 @@ use crate::tool::{read::ReadTool, search_file::SearchFileTool, write::WriteTool}
 
 /// 默认系统提示。
 ///
-/// 当前保持为空，后续可按 provider 细化。
-pub const PREMABLE: &str = "";
+/// 这里给出“先定位源码、再读取文件”的最小工作流约束，减少模型在编码场景下反复向用户追问路径。
+pub const PREMABLE: &str = r#"你是仓库内的代码助手。
+当用户没有明确给出文件路径时，请先调用 SearchFileTool 在当前工作区搜索，再调用 ReadTool 读取命中文件。
+请遵循以下规则：
+1. SearchFileTool 的 `path` 优先使用 `.`。
+2. SearchFileTool 返回格式是 `<relative_path>:<line>:<line_content>`；后续调用 ReadTool/WriteTool 时只传 `relative_path`。
+3. 读写路径只能使用工作区相对路径，不要要求用户提供绝对路径或当前目录。
+4. 若首次关键词无结果，请自行更换 1-2 组同义关键词后再决定是否向用户追问。
+5. 在完成至少一次“搜索或读取”之前，不要先向用户追问实现细节；优先基于现有代码自行推进。
+6. 仅当存在真实阻塞（如需求冲突、权限限制、上下文缺失且无法通过工具补齐）时，才进行最小化追问。
+7. 当用户请求“修改代码/修复问题/实现功能”时，默认立即动手执行：必须调用工具完成改动，而不是只回复计划、确认或承诺“下一步会做”。
+8. 禁止只输出类似“我会继续”“我现在开始提交补丁”的过程性话术；若可以执行，就直接执行并产出结果。
+9. 完成改动后，给出最小必要的结果说明：改了哪些文件、为什么这么改、如何验证。"#;
+
+/// agent 多轮上限默认值。
+///
+/// rig 0.30 的 `default_max_turns` 默认为 `None`，在请求阶段会回退为 `0`，
+/// 当模型需要连续多轮工具调用时会触发 `MaxTurnError(reached max turn limit: 0)`。
+/// 这里显式设置一个保守上限，避免 Codex/工具链场景在首轮就被硬性终止。
+const DEFAULT_AGENT_MAX_TURNS: usize = 12;
+/// 可接受的最大轮次上限，避免配置异常导致超长循环。
+const MAX_AGENT_MAX_TURNS: usize = 64;
+/// 能力降级最多允许的步数，防止同一请求在错误分类不稳定时陷入长链路重试。
+const MAX_CAPABILITY_FALLBACK_STEPS: usize = 3;
+/// 每次请求允许的最大尝试次数（首轮 + 降级重试）。
+const MAX_CAPABILITY_ATTEMPTS: u32 = MAX_CAPABILITY_FALLBACK_STEPS as u32 + 1;
+/// 运行时降级缓存默认有效期：24 小时。
+const RUNTIME_FALLBACK_CACHE_TTL_SECONDS: u64 = 24 * 60 * 60;
 
 /// 将协商结果落地到 rig 的 agent builder（宏形式避免引入具体 builder 类型）。
 ///
@@ -40,9 +71,10 @@ pub const PREMABLE: &str = "";
 /// - rig 的 builder 类型在不同 client/feature 下可能包含泛型或生命周期参数；
 /// - 使用宏可以直接在调用点做链式调用，减少类型推断/签名耦合带来的编译脆弱性。
 macro_rules! build_agent_with_options {
-    ($builder:expr, $negotiated:expr) => {{
+    ($builder:expr, $negotiated:expr, $max_turns:expr) => {{
         let builder = $builder;
         let negotiated = $negotiated;
+        let max_turns = $max_turns;
 
         if negotiated.tools_enabled {
             if negotiated.system_preamble_enabled && !PREMABLE.trim().is_empty() {
@@ -51,18 +83,23 @@ macro_rules! build_agent_with_options {
                     .tool(ReadTool)
                     .tool(WriteTool)
                     .tool(SearchFileTool)
+                    .default_max_turns(max_turns)
                     .build()
             } else {
                 builder
                     .tool(ReadTool)
                     .tool(WriteTool)
                     .tool(SearchFileTool)
+                    .default_max_turns(max_turns)
                     .build()
             }
         } else if negotiated.system_preamble_enabled && !PREMABLE.trim().is_empty() {
-            builder.preamble(PREMABLE).build()
+            builder
+                .preamble(PREMABLE)
+                .default_max_turns(max_turns)
+                .build()
         } else {
-            builder.build()
+            builder.default_max_turns(max_turns).build()
         }
     }};
 }
@@ -302,6 +339,11 @@ pub struct Connection {
     api_key: String,
     agent_select: String,
     support_tools: bool,
+    /// agent 默认多轮上限（可配置）。
+    ///
+    /// - `None` 或 `Some(0)` 会回退到 `DEFAULT_AGENT_MAX_TURNS`；
+    /// - 过大值会被裁剪到 `MAX_AGENT_MAX_TURNS`，防止异常配置造成长循环。
+    max_turns: Option<usize>,
     /// provider 能力覆盖（可选）。
     ///
     /// 为什么放在 Connection 上：
@@ -318,6 +360,7 @@ impl Connection {
         api_key: String,
         agent_select: String,
         support_tools: bool,
+        max_turns: Option<usize>,
         capabilities: Option<ProviderCapabilitiesOverride>,
     ) -> Self {
         Self {
@@ -326,6 +369,7 @@ impl Connection {
             api_key,
             agent_select,
             support_tools,
+            max_turns,
             capabilities,
         }
     }
@@ -353,6 +397,16 @@ impl Connection {
     /// 当前模型是否允许调用工具。
     pub fn support_tools(&self) -> bool {
         self.support_tools
+    }
+
+    /// 解析并返回当前连接应使用的多轮上限。
+    ///
+    /// 这里把“缺省、非法、过大”统一归一化，保证最终传给 rig 的值稳定可控。
+    fn effective_max_turns(&self) -> usize {
+        match self.max_turns {
+            Some(value) if value > 0 => value.min(MAX_AGENT_MAX_TURNS),
+            _ => DEFAULT_AGENT_MAX_TURNS,
+        }
     }
 
     /// 解析可用 API Key：优先使用连接配置，其次读取环境变量。
@@ -399,6 +453,7 @@ impl Connection {
     /// - 这样可以在运行时降级后重建 client，而不必改写 Connection 本身。
     fn build_client(&self, negotiated: &NegotiatedCapabilities) -> Result<BuiltClient> {
         let custom_base_url = self.normalized_api_url();
+        let max_turns = self.effective_max_turns();
 
         match self.provider {
             Provider::OpenAI => {
@@ -411,8 +466,11 @@ impl Connection {
                         }
 
                         let client = builder.build()?;
-                        let agent =
-                            build_agent_with_options!(client.agent(&self.agent_select), negotiated);
+                        let agent = build_agent_with_options!(
+                            client.agent(&self.agent_select),
+                            negotiated,
+                            max_turns
+                        );
                         Ok(BuiltClient::OpenAI(agent))
                     }
                     ModelEndpoint::ChatCompletions => {
@@ -422,8 +480,11 @@ impl Connection {
                         }
 
                         let client = builder.build()?;
-                        let agent =
-                            build_agent_with_options!(client.agent(&self.agent_select), negotiated);
+                        let agent = build_agent_with_options!(
+                            client.agent(&self.agent_select),
+                            negotiated,
+                            max_turns
+                        );
                         Ok(BuiltClient::OpenAIChat(agent))
                     }
                 }
@@ -441,7 +502,11 @@ impl Connection {
                 let client = builder.build()?;
                 // Codex 的主要价值在于"带工具的编码工作流"，
                 // 但仍需尊重能力协商结果，避免网关不兼容导致整次请求失败。
-                let agent = build_agent_with_options!(client.agent(&self.agent_select), negotiated);
+                let agent = build_agent_with_options!(
+                    client.agent(&self.agent_select),
+                    negotiated,
+                    max_turns
+                );
                 Ok(BuiltClient::Codex(agent))
             }
             Provider::Claude => {
@@ -452,7 +517,11 @@ impl Connection {
                 }
 
                 let client = builder.build()?;
-                let agent = build_agent_with_options!(client.agent(&self.agent_select), negotiated);
+                let agent = build_agent_with_options!(
+                    client.agent(&self.agent_select),
+                    negotiated,
+                    max_turns
+                );
                 Ok(BuiltClient::Claude(agent))
             }
             Provider::Gemini => {
@@ -463,7 +532,11 @@ impl Connection {
                 }
 
                 let client = builder.build()?;
-                let agent = build_agent_with_options!(client.agent(&self.agent_select), negotiated);
+                let agent = build_agent_with_options!(
+                    client.agent(&self.agent_select),
+                    negotiated,
+                    max_turns
+                );
                 Ok(BuiltClient::Gemini(agent))
             }
             Provider::OpenAIAPI => {
@@ -474,52 +547,120 @@ impl Connection {
                 }
 
                 let client = builder.build()?;
-                let agent = build_agent_with_options!(client.agent(&self.agent_select), negotiated);
+                let agent = build_agent_with_options!(
+                    client.agent(&self.agent_select),
+                    negotiated,
+                    max_turns
+                );
                 Ok(BuiltClient::OpenAIAPI(agent))
             }
         }
     }
 
-    /// 判断错误是否属于“工具定义不可用”类型。
+    /// 将运行时错误映射为标准分类。
     ///
-    /// 之所以采用文本匹配而不是错误类型匹配：
-    /// - 不同 provider/网关返回的错误类型并不统一；
-    /// - 统一按关键语义降级，能覆盖更多兼容实现。
+    /// 分类时显式传入 endpoint 与请求能力标记，避免只看文案导致误判。
+    fn classify_error(
+        error: &anyhow::Error,
+        negotiated: &NegotiatedCapabilities,
+    ) -> ClassifiedError {
+        ErrorClassifier::default().classify(
+            error,
+            negotiated.endpoint,
+            RequestFeatureFlags::from_negotiated(negotiated),
+        )
+    }
+
+    /// 为运行时降级写回构建缓存上下文。
+    ///
+    /// 这里将分类器输出的置信度带入缓存，便于后续诊断判断该降级是否可靠。
+    fn build_runtime_writeback_context(
+        classified: &ClassifiedError,
+        reason: &str,
+    ) -> CapabilityWritebackContext {
+        CapabilityWritebackContext::runtime(reason)
+            .with_ttl_seconds(RUNTIME_FALLBACK_CACHE_TTL_SECONDS)
+            .with_confidence(classified.confidence_hint())
+    }
+
+    /// 以“尽力而为”方式写回降级缓存。
+    ///
+    /// 写回失败时只记录日志，不中断当前请求主流程。
+    fn writeback_fallback_cache_best_effort(
+        resolver: &CapabilityResolver,
+        workspace_root: &Path,
+        trace_id: &str,
+        provider: Provider,
+        api_url: Option<&str>,
+        model: &str,
+        capabilities: ProviderCapabilities,
+        context: &CapabilityWritebackContext,
+    ) {
+        if let Err(writeback_error) = resolver.writeback_cache_with_context(
+            workspace_root,
+            provider,
+            api_url,
+            model,
+            capabilities,
+            context,
+        ) {
+            log_event_best_effort(
+                workspace_root,
+                AgentEvent::ToolCallEnd {
+                    ts: ts(),
+                    trace_id: trace_id.to_string(),
+                    tool: "capability_cache_writeback".to_string(),
+                    ok: false,
+                    duration_ms: 0,
+                    error: Some(writeback_error.to_string()),
+                },
+            );
+        }
+    }
+
+    /// 兼容历史单测入口：判断是否应降级关闭 tools。
+    #[cfg(test)]
     fn should_retry_without_tools(error: &anyhow::Error) -> bool {
-        let normalized = error.to_string().to_ascii_lowercase();
-        normalized.contains("failed to get tool definitions")
-            || normalized.contains("tool definitions")
-            || normalized.contains("tool definition")
+        let classified = ErrorClassifier::default().classify(
+            error,
+            ModelEndpoint::ChatCompletions,
+            RequestFeatureFlags {
+                tools_enabled: true,
+                stream_enabled: false,
+                responses_enabled: false,
+            },
+        );
+        classified.category == super::fallback::ErrorCategory::ToolsUnsupported
     }
 
-    /// 判断错误是否属于“responses API 不兼容”类型。
-    ///
-    /// 仍采用文本匹配的原因与 tools 类似：不同网关的错误格式差异很大。
+    /// 兼容历史单测入口：判断是否应降级关闭 responses API。
+    #[cfg(test)]
     fn should_retry_without_responses_api(error: &anyhow::Error) -> bool {
-        let normalized = error.to_string().to_ascii_lowercase();
-        // 典型场景：网关不支持 `/responses` 端点，返回 404/unknown endpoint。
-        (normalized.contains("responses") && normalized.contains("404"))
-            || normalized.contains("unknown endpoint")
-            || normalized.contains("not found") && normalized.contains("responses")
+        let classified = ErrorClassifier::default().classify(
+            error,
+            ModelEndpoint::ResponsesApi,
+            RequestFeatureFlags {
+                tools_enabled: false,
+                stream_enabled: false,
+                responses_enabled: true,
+            },
+        );
+        classified.category == super::fallback::ErrorCategory::ResponsesUnsupported
     }
 
-    /// 判断错误是否属于“streaming 不兼容”类型。
-    ///
-    /// 这里仍使用关键字匹配而不是类型匹配，原因与其它降级规则一致：
-    /// 不同 provider/网关返回的错误结构差异较大，需要保持宽松兼容。
+    /// 兼容历史单测入口：判断是否应降级关闭 streaming。
+    #[cfg(test)]
     fn should_retry_without_stream(error: &anyhow::Error) -> bool {
-        let normalized = error.to_string().to_ascii_lowercase();
-        let mentions_stream = normalized.contains("stream")
-            || normalized.contains("streaming")
-            || normalized.contains("sse");
-        let looks_unsupported = normalized.contains("not support")
-            || normalized.contains("unsupported")
-            || normalized.contains("unknown")
-            || normalized.contains("invalid")
-            || normalized.contains("not found")
-            || normalized.contains("400")
-            || normalized.contains("404");
-        mentions_stream && looks_unsupported
+        let classified = ErrorClassifier::default().classify(
+            error,
+            ModelEndpoint::ChatCompletions,
+            RequestFeatureFlags {
+                tools_enabled: false,
+                stream_enabled: true,
+                responses_enabled: false,
+            },
+        );
+        classified.category == super::fallback::ErrorCategory::StreamUnsupported
     }
 
     /// 对外响应接口：发送单轮请求（默认生成 trace_id）。
@@ -625,19 +766,81 @@ impl Connection {
                 on_event(ModelStreamEvent::Done);
                 Ok(TracedModelResponse { trace_id, content })
             }
-            Err(error) if Self::should_retry_without_stream(&error) => {
-                let fallback = self
-                    .response_with_history_as_single_event(trace_id, prompt, history, &mut on_event)
-                    .await;
-                // streaming 不兼容后的降级调用若再次失败，同样需要发出 `error` 事件。
-                if let Err(fallback_error) = &fallback {
-                    on_event(ModelStreamEvent::Error {
-                        message: fallback_error.to_string(),
-                    });
-                }
-                fallback
-            }
             Err(error) => {
+                let classified = Self::classify_error(&error, &negotiated);
+                log_event_best_effort(
+                    &workspace_root,
+                    AgentEvent::ErrorClassified {
+                        ts: ts(),
+                        trace_id: trace_id.clone(),
+                        category: classified.category.as_str().to_string(),
+                        status_code: classified.status_code,
+                        provider_error_code: classified.provider_error_code.clone(),
+                        endpoint: negotiated.endpoint.as_str().to_string(),
+                        tools: negotiated.tools_enabled,
+                        stream: negotiated.stream_enabled,
+                        responses: negotiated.endpoint == ModelEndpoint::ResponsesApi,
+                        degradable: classified.is_degradable(),
+                        summary: classified.summary.clone(),
+                    },
+                );
+
+                let mut plan = CapabilityFallbackPlan::new(1, 2);
+                if let Some(step) = plan.next_step(&negotiated, &classified) {
+                    let downgraded = step.apply_to(&negotiated);
+                    log_event_best_effort(
+                        &workspace_root,
+                        AgentEvent::RetryScheduled {
+                            ts: ts(),
+                            trace_id: trace_id.clone(),
+                            attempt: 2,
+                            reason: format!("{}:{}", classified.category.as_str(), step.reason),
+                        },
+                    );
+
+                    Self::writeback_fallback_cache_best_effort(
+                        &resolver,
+                        &workspace_root,
+                        &trace_id,
+                        self.provider,
+                        custom_base_url.as_deref(),
+                        &model,
+                        downgraded.provider_capabilities,
+                        &Self::build_runtime_writeback_context(&classified, step.reason),
+                    );
+
+                    log_event_best_effort(
+                        &workspace_root,
+                        AgentEvent::FallbackApplied {
+                            ts: ts(),
+                            trace_id: trace_id.clone(),
+                            reason: format!("{}:{}", classified.category.as_str(), step.reason),
+                            from_endpoint: negotiated.endpoint.as_str().to_string(),
+                            to_endpoint: downgraded.endpoint.as_str().to_string(),
+                            tools_from: negotiated.tools_enabled,
+                            tools_to: downgraded.tools_enabled,
+                            system_from: negotiated.system_preamble_enabled,
+                            system_to: downgraded.system_preamble_enabled,
+                        },
+                    );
+
+                    let fallback = self
+                        .response_with_history_as_single_event(
+                            trace_id,
+                            prompt,
+                            history,
+                            &mut on_event,
+                        )
+                        .await;
+                    // streaming 不兼容后的降级调用若再次失败，同样需要发出 `error` 事件。
+                    if let Err(fallback_error) = &fallback {
+                        on_event(ModelStreamEvent::Error {
+                            message: fallback_error.to_string(),
+                        });
+                    }
+                    return fallback;
+                }
+
                 on_event(ModelStreamEvent::Error {
                     message: error.to_string(),
                 });
@@ -708,12 +911,14 @@ impl Connection {
             },
         );
 
-        // 尝试执行请求，并在必要时降级重试一次。
+        // 尝试执行请求，并在必要时由“显式降级状态机”驱动后续重试。
         let mut attempts: u32 = 1;
         let mut current = negotiated;
         let mut last_error: Option<anyhow::Error> = None;
+        let mut plan =
+            CapabilityFallbackPlan::new(MAX_CAPABILITY_FALLBACK_STEPS, MAX_CAPABILITY_ATTEMPTS);
 
-        for attempt in 1..=2 {
+        for attempt in 1..=plan.max_attempts() {
             attempts = attempt;
 
             let call_result: Result<String> = with_trace_id(trace_id.clone(), async {
@@ -747,118 +952,75 @@ impl Connection {
                     return Ok(TracedModelResponse { trace_id, content });
                 }
                 Err(error) => {
+                    let classified = Self::classify_error(&error, &current);
+                    log_event_best_effort(
+                        &workspace_root,
+                        AgentEvent::ErrorClassified {
+                            ts: ts(),
+                            trace_id: trace_id.clone(),
+                            category: classified.category.as_str().to_string(),
+                            status_code: classified.status_code,
+                            provider_error_code: classified.provider_error_code.clone(),
+                            endpoint: current.endpoint.as_str().to_string(),
+                            tools: current.tools_enabled,
+                            stream: current.stream_enabled,
+                            responses: current.endpoint == ModelEndpoint::ResponsesApi,
+                            degradable: classified.is_degradable(),
+                            summary: classified.summary.clone(),
+                        },
+                    );
                     last_error = Some(error);
+
+                    // 不可降级错误（鉴权、限流、参数错误等）直接失败，避免无意义重试。
+                    if attempt >= plan.max_attempts() {
+                        break;
+                    }
+
+                    let Some(step) = plan.next_step(&current, &classified) else {
+                        break;
+                    };
+
+                    log_event_best_effort(
+                        &workspace_root,
+                        AgentEvent::RetryScheduled {
+                            ts: ts(),
+                            trace_id: trace_id.clone(),
+                            attempt: attempt + 1,
+                            reason: format!("{}:{}", classified.category.as_str(), step.reason),
+                        },
+                    );
+
+                    let from = current.clone();
+                    current = step.apply_to(&from);
+
+                    // 写回缓存，确保同一 provider 后续请求不再重复踩坑。
+                    Self::writeback_fallback_cache_best_effort(
+                        &resolver,
+                        &workspace_root,
+                        &trace_id,
+                        self.provider,
+                        custom_base_url.as_deref(),
+                        &model,
+                        current.provider_capabilities,
+                        &Self::build_runtime_writeback_context(&classified, step.reason),
+                    );
+
+                    log_event_best_effort(
+                        &workspace_root,
+                        AgentEvent::FallbackApplied {
+                            ts: ts(),
+                            trace_id: trace_id.clone(),
+                            reason: format!("{}:{}", classified.category.as_str(), step.reason),
+                            from_endpoint: from.endpoint.as_str().to_string(),
+                            to_endpoint: current.endpoint.as_str().to_string(),
+                            tools_from: from.tools_enabled,
+                            tools_to: current.tools_enabled,
+                            system_from: from.system_preamble_enabled,
+                            system_to: current.system_preamble_enabled,
+                        },
+                    );
                 }
             }
-
-            let Some(error) = last_error.as_ref() else {
-                break;
-            };
-
-            // 只允许一次降级重试，避免无限循环。
-            if attempt >= 2 {
-                break;
-            }
-
-            // 运行时降级策略：优先处理 tools，不行再处理 responses API。
-            let mut downgrade: Option<(ProviderCapabilitiesOverride, &'static str)> = None;
-            if current.tools_enabled && Self::should_retry_without_tools(error) {
-                downgrade = Some((
-                    ProviderCapabilitiesOverride {
-                        supports_tools: Some(false),
-                        ..Default::default()
-                    },
-                    "tools_not_supported",
-                ));
-            } else if current.endpoint == ModelEndpoint::ResponsesApi
-                && Self::should_retry_without_responses_api(error)
-            {
-                downgrade = Some((
-                    ProviderCapabilitiesOverride {
-                        supports_responses_api: Some(false),
-                        ..Default::default()
-                    },
-                    "responses_api_not_supported",
-                ));
-            }
-
-            let Some((downgrade_override, reason)) = downgrade else {
-                break;
-            };
-
-            log_event_best_effort(
-                &workspace_root,
-                AgentEvent::RetryScheduled {
-                    ts: ts(),
-                    trace_id: trace_id.clone(),
-                    attempt: attempt + 1,
-                    reason: reason.to_string(),
-                },
-            );
-
-            let from = current.clone();
-            let downgraded_provider_caps = from
-                .provider_capabilities
-                .downgrade(downgrade_override.clone());
-
-            // 写回缓存，确保同一 provider 后续请求不再重复踩坑。
-            if let Err(writeback_error) = resolver.writeback_cache(
-                &workspace_root,
-                self.provider,
-                custom_base_url.as_deref(),
-                &model,
-                downgraded_provider_caps,
-            ) {
-                // 缓存写回失败不应影响本次请求的降级重试。
-                log_event_best_effort(
-                    &workspace_root,
-                    AgentEvent::ToolCallEnd {
-                        ts: ts(),
-                        trace_id: trace_id.clone(),
-                        tool: "capability_cache_writeback".to_string(),
-                        ok: false,
-                        duration_ms: 0,
-                        error: Some(writeback_error.to_string()),
-                    },
-                );
-            }
-
-            // 本次重试直接使用降级后的能力，避免被配置覆盖重新打开导致重复失败。
-            current = NegotiatedCapabilities {
-                provider_capabilities: downgraded_provider_caps,
-                tools_enabled: from.tools_enabled
-                    && downgrade_override.supports_tools != Some(false),
-                system_preamble_enabled: from.system_preamble_enabled
-                    && downgrade_override.supports_system_preamble != Some(false),
-                endpoint: if downgrade_override.supports_responses_api == Some(false) {
-                    ModelEndpoint::ChatCompletions
-                } else {
-                    from.endpoint
-                },
-                stream_enabled: from.stream_enabled
-                    && downgrade_override.supports_stream != Some(false),
-                // 运行时降级属于新的来源标签，便于后续排查。
-                sources: {
-                    let mut tags = from.sources.clone();
-                    tags.push(format!("runtime:{reason}"));
-                    tags
-                },
-            };
-
-            log_event_best_effort(
-                &workspace_root,
-                AgentEvent::FallbackApplied {
-                    ts: ts(),
-                    trace_id: trace_id.clone(),
-                    reason: reason.to_string(),
-                    from_endpoint: from.endpoint.as_str().to_string(),
-                    to_endpoint: current.endpoint.as_str().to_string(),
-                    tools_from: from.tools_enabled,
-                    tools_to: current.tools_enabled,
-                    system_from: from.system_preamble_enabled,
-                    system_to: current.system_preamble_enabled,
-                },
-            );
         }
 
         let duration_ms = start_at.elapsed().as_millis();
@@ -879,7 +1041,7 @@ impl Connection {
             },
         );
 
-        if attempts >= 2 {
+        if attempts > 1 {
             log_event_best_effort(
                 &workspace_root,
                 AgentEvent::RetryExhausted {
@@ -947,9 +1109,18 @@ impl std::error::Error for TracedModelError {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, time::SystemTime};
+
     use anyhow::anyhow;
 
-    use super::Connection;
+    use super::{
+        BuiltClient, Connection, DEFAULT_AGENT_MAX_TURNS, ModelEndpoint, NegotiatedCapabilities,
+        Provider,
+    };
+    use crate::model::capabilities::{
+        CapabilityResolver, CapabilityWritebackContext, ProviderCapabilities,
+        ProviderCapabilitiesOverride,
+    };
 
     #[test]
     fn should_retry_without_tools_when_error_mentions_tool_definitions() {
@@ -964,6 +1135,18 @@ mod tests {
     }
 
     #[test]
+    fn should_retry_without_responses_for_responses_endpoint_error() {
+        let error = anyhow!("404 Not Found: unknown endpoint /v1/responses");
+        assert!(Connection::should_retry_without_responses_api(&error));
+    }
+
+    #[test]
+    fn should_not_retry_without_responses_for_unrelated_error() {
+        let error = anyhow!("401 Unauthorized");
+        assert!(!Connection::should_retry_without_responses_api(&error));
+    }
+
+    #[test]
     fn should_retry_without_stream_when_error_indicates_stream_unsupported() {
         let error = anyhow!("400 Bad Request: streaming is not supported by current endpoint");
         assert!(Connection::should_retry_without_stream(&error));
@@ -973,5 +1156,141 @@ mod tests {
     fn should_not_retry_without_stream_for_unrelated_error() {
         let error = anyhow!("401 Unauthorized");
         assert!(!Connection::should_retry_without_stream(&error));
+    }
+
+    #[test]
+    fn build_codex_client_should_apply_default_max_turns() {
+        // 这里使用本地构建路径做回归校验，确保不会因为 rig 默认值变更再次退化为 0。
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should be buildable");
+        let _guard = runtime.enter();
+
+        let connection = Connection::new(
+            Provider::Codex,
+            String::new(),
+            "test-key".to_string(),
+            "gpt-5.3-codex".to_string(),
+            true,
+            None,
+            None,
+        );
+        let negotiated = NegotiatedCapabilities {
+            provider_capabilities: ProviderCapabilities {
+                supports_tools: true,
+                supports_system_preamble: true,
+                supports_responses_api: false,
+                supports_stream: true,
+            },
+            tools_enabled: true,
+            system_preamble_enabled: true,
+            endpoint: ModelEndpoint::ChatCompletions,
+            stream_enabled: true,
+            sources: vec!["test".to_string()],
+        };
+
+        let built = connection
+            .build_client(&negotiated)
+            .expect("codex client should be buildable");
+        match built {
+            BuiltClient::Codex(agent) => {
+                assert_eq!(agent.default_max_turns, Some(DEFAULT_AGENT_MAX_TURNS));
+            }
+            _ => panic!("expected codex client"),
+        }
+    }
+
+    #[test]
+    fn build_codex_client_should_apply_configured_max_turns() {
+        // 配置值应覆盖默认值，便于用户按模型/网关特性调整多轮上限。
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should be buildable");
+        let _guard = runtime.enter();
+
+        let connection = Connection::new(
+            Provider::Codex,
+            String::new(),
+            "test-key".to_string(),
+            "gpt-5.3-codex".to_string(),
+            true,
+            Some(24),
+            None,
+        );
+        let negotiated = NegotiatedCapabilities {
+            provider_capabilities: ProviderCapabilities {
+                supports_tools: true,
+                supports_system_preamble: true,
+                supports_responses_api: false,
+                supports_stream: true,
+            },
+            tools_enabled: true,
+            system_preamble_enabled: true,
+            endpoint: ModelEndpoint::ChatCompletions,
+            stream_enabled: true,
+            sources: vec!["test".to_string()],
+        };
+
+        let built = connection
+            .build_client(&negotiated)
+            .expect("codex client should be buildable");
+        match built {
+            BuiltClient::Codex(agent) => {
+                assert_eq!(agent.default_max_turns, Some(24));
+            }
+            _ => panic!("expected codex client"),
+        }
+    }
+
+    #[test]
+    fn capability_cache_writeback_failure_should_not_break_flow() {
+        // 这里故意把“工作区根路径”指向一个普通文件，触发缓存写回失败分支。
+        // 验证目标是：写回失败只记录日志，不影响后续降级流程继续执行。
+        let stamp = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!(
+            "order-connection-writeback-fail-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp directory should be created");
+        let fake_workspace_root = temp_root.join("root_is_a_file");
+        fs::write(&fake_workspace_root, "x").expect("temp marker file should be created");
+
+        let resolver = CapabilityResolver::default();
+        let downgraded_caps = ProviderCapabilities {
+            supports_tools: false,
+            supports_system_preamble: true,
+            supports_responses_api: false,
+            supports_stream: true,
+        };
+        Connection::writeback_fallback_cache_best_effort(
+            &resolver,
+            &fake_workspace_root,
+            "trace-test",
+            Provider::OpenAI,
+            None,
+            "gpt-test",
+            downgraded_caps,
+            &CapabilityWritebackContext::runtime("tools_not_supported"),
+        );
+
+        // 若主流程未被中断，后续降级能力仍可继续应用。
+        let applied = ProviderCapabilities {
+            supports_tools: true,
+            supports_system_preamble: true,
+            supports_responses_api: true,
+            supports_stream: true,
+        }
+        .downgrade(ProviderCapabilitiesOverride {
+            supports_tools: Some(false),
+            ..Default::default()
+        });
+        assert!(!applied.supports_tools);
+
+        let _ = fs::remove_dir_all(temp_root);
     }
 }

@@ -149,6 +149,30 @@ impl ExecutionGuard {
         })
     }
 
+    /// 查询指定 trace_id 的待确认写入摘要。
+    ///
+    /// 返回空列表而非报错的原因：
+    /// - TUI 会在每轮请求结束后探测是否有待确认写入；
+    /// - “无待确认写入”属于正常路径，不应强迫调用方处理错误分支。
+    pub fn list_pending_writes(&self, trace_id: &str) -> Result<Vec<PendingWriteSummary>> {
+        let root = workspace_root().map_err(|e| anyhow!(e))?;
+        let pending_dir = pending_trace_dir(&root, trace_id);
+        if !pending_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let records = read_pending_write_records(&pending_dir)?;
+        Ok(records
+            .into_iter()
+            .map(|record| PendingWriteSummary {
+                trace_id: record.trace_id,
+                path: record.path,
+                append: record.append,
+                diff: record.diff,
+            })
+            .collect())
+    }
+
     /// 应用 trace_id 对应的所有 pending write：先建快照，再写入，然后清理 pending。
     pub fn apply_pending_writes(&self, trace_id: &str) -> Result<ApplyPendingResult> {
         let root = workspace_root().map_err(|e| anyhow!(e))?;

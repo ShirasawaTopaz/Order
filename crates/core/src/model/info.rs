@@ -41,6 +41,12 @@ pub struct ModelInfo {
     pub model_max_output: u32,
     /// 模型最大 token 总预算。
     pub model_max_tokens: u32,
+    /// agent 默认多轮上限（0 表示使用系统默认值）。
+    ///
+    /// 该字段用于控制工具链场景下的多轮调用深度，避免因默认值不一致导致
+    /// `MaxTurnError` 或异常长循环。
+    #[serde(default)]
+    pub default_max_turns: u32,
 }
 
 type ModelInfoList = Vec<ModelInfo>;
@@ -170,12 +176,15 @@ fn load_explicit_model_from_env() -> Option<ModelInfo> {
         first_non_empty_env(&["ORDER_MODEL_API_URL", "ORDER_API_URL"]).unwrap_or_default();
     let token = first_non_empty_env(&["ORDER_MODEL_TOKEN", "ORDER_API_KEY"]).unwrap_or_default();
 
-    // 对 Codex 默认启用 tools：
-    // - Codex 主打“带工具的编码工作流”，用户未显式配置时应开箱即用；
+    // 对 OpenAI/Codex 默认启用 tools：
+    // - 两者在编码助手场景下都依赖工具链才能“少追问、先执行”；
     // - 若用户显式设置了 `ORDER_MODEL_SUPPORT_TOOLS`，则尊重用户选择。
     let support_tools = match first_non_empty_env(&["ORDER_MODEL_SUPPORT_TOOLS"]) {
         Some(value) => parse_bool_text(&value),
-        None => provider_name.eq_ignore_ascii_case("codex"),
+        None => {
+            provider_name.eq_ignore_ascii_case("codex")
+                || provider_name.eq_ignore_ascii_case("openai")
+        }
     };
     let model_max_context = first_non_empty_env(&["ORDER_MODEL_MAX_CONTEXT"])
         .and_then(|value| value.parse::<u32>().ok())
@@ -184,6 +193,10 @@ fn load_explicit_model_from_env() -> Option<ModelInfo> {
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(0);
     let model_max_tokens = first_non_empty_env(&["ORDER_MODEL_MAX_TOKENS"])
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    // 约定：环境变量未设置或为 0 时，连接层回退到系统默认多轮上限。
+    let default_max_turns = first_non_empty_env(&["ORDER_MODEL_MAX_TURNS"])
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(0);
 
@@ -197,6 +210,7 @@ fn load_explicit_model_from_env() -> Option<ModelInfo> {
         model_max_context,
         model_max_output,
         model_max_tokens,
+        default_max_turns,
     }))
 }
 
@@ -232,6 +246,7 @@ fn load_fallback_model_from_provider_env() -> Option<ModelInfo> {
             model_max_context: 0,
             model_max_output: 0,
             model_max_tokens: 0,
+            default_max_turns: 0,
         });
     }
 
@@ -247,12 +262,14 @@ fn load_fallback_model_from_provider_env() -> Option<ModelInfo> {
             api_url,
             token,
             model_name,
-            support_tools: false,
+            // OpenAI 兜底模型默认开启 tools，降低“反复追问路径”的概率。
+            support_tools: true,
             capabilities: None,
             provider_name: "openai".to_string(),
             model_max_context: 0,
             model_max_output: 0,
             model_max_tokens: 0,
+            default_max_turns: 0,
         });
     }
 
@@ -273,6 +290,7 @@ fn load_fallback_model_from_provider_env() -> Option<ModelInfo> {
             model_max_context: 0,
             model_max_output: 0,
             model_max_tokens: 0,
+            default_max_turns: 0,
         });
     }
 
@@ -293,6 +311,7 @@ fn load_fallback_model_from_provider_env() -> Option<ModelInfo> {
             model_max_context: 0,
             model_max_output: 0,
             model_max_tokens: 0,
+            default_max_turns: 0,
         });
     }
 
@@ -446,8 +465,8 @@ fn parse_model_info_from_value(value: &Value) -> Option<ModelInfo> {
         // 显式声明时尊重配置值，避免自动开启工具导致意外副作用。
         read_bool_key(object, &["support_tools", "supportTools"]).unwrap_or(false)
     } else {
-        // 未显式声明时对 Codex 默认开启 tools，保持“编码助手”体验一致。
-        provider_name.eq_ignore_ascii_case("codex")
+        // 未显式声明时对 OpenAI/Codex 默认开启 tools，减少“只追问不执行”。
+        provider_name.eq_ignore_ascii_case("codex") || provider_name.eq_ignore_ascii_case("openai")
     };
     let model_max_context =
         read_u32_key(object, &["model_max_context", "modelMaxContext"]).unwrap_or(0);
@@ -455,6 +474,17 @@ fn parse_model_info_from_value(value: &Value) -> Option<ModelInfo> {
         read_u32_key(object, &["model_max_output", "modelMaxOutput"]).unwrap_or(0);
     let model_max_tokens =
         read_u32_key(object, &["model_max_tokens", "modelMaxTokens"]).unwrap_or(0);
+    // 兼容多种命名，便于用户从旧配置平滑迁移到新字段。
+    let default_max_turns = read_u32_key(
+        object,
+        &[
+            "default_max_turns",
+            "defaultMaxTurns",
+            "max_turns",
+            "maxTurns",
+        ],
+    )
+    .unwrap_or(0);
 
     Some(normalize_model_info(ModelInfo {
         api_url,
@@ -466,6 +496,7 @@ fn parse_model_info_from_value(value: &Value) -> Option<ModelInfo> {
         model_max_context,
         model_max_output,
         model_max_tokens,
+        default_max_turns,
     }))
 }
 
@@ -648,6 +679,7 @@ fn load_codex_cli_config() -> Option<ModelInfo> {
         model_max_context: 0,
         model_max_output: 0,
         model_max_tokens: 0,
+        default_max_turns: 0,
     })
 }
 
@@ -740,6 +772,34 @@ mod tests {
         assert_eq!(model.model_name, "gpt-4o-mini");
         assert_eq!(model.token, "abc");
         assert_eq!(model.api_url, "https://api.openai.com/v1");
+        assert!(model.support_tools);
+        assert_eq!(model.default_max_turns, 0);
+    }
+
+    #[test]
+    fn parse_openai_model_object_should_respect_explicit_support_tools_false() {
+        let value = json!({
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "support_tools": false
+        });
+
+        let model = parse_model_info_from_value(&value).expect("should parse model");
+        assert_eq!(model.provider_name, "openai");
+        assert!(!model.support_tools);
+    }
+
+    #[test]
+    fn parse_model_object_with_default_max_turns() {
+        let value = json!({
+            "provider": "codex",
+            "model": "gpt-5.3-codex",
+            "default_max_turns": 20
+        });
+
+        let model = parse_model_info_from_value(&value).expect("should parse model");
+        assert_eq!(model.provider_name, "codex");
+        assert_eq!(model.default_max_turns, 20);
     }
 
     #[test]

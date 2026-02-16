@@ -296,6 +296,21 @@ fn test_completion_partial_match() {
 }
 
 #[test]
+fn test_completion_capability_command() {
+    let mut state = InputState::default();
+    for ch in "/cap".chars() {
+        state.insert_char(ch);
+    }
+
+    assert!(
+        state
+            .filtered_commands
+            .iter()
+            .any(|(cmd, _)| cmd == "/capability")
+    );
+}
+
+#[test]
 fn test_completion_scroll_offset() {
     let mut state = InputState::default();
     state.insert_char('/');

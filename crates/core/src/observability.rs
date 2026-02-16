@@ -1,7 +1,10 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -64,6 +67,20 @@ pub enum AgentEvent {
         attempt: u32,
         reason: String,
     },
+    /// 错误分类结果（用于解释“为何触发/不触发降级”）。
+    ErrorClassified {
+        ts: String,
+        trace_id: String,
+        category: String,
+        status_code: Option<u16>,
+        provider_error_code: Option<String>,
+        endpoint: String,
+        tools: bool,
+        stream: bool,
+        responses: bool,
+        degradable: bool,
+        summary: String,
+    },
     /// 重试用尽（本实现当前最多重试一次，保留事件用于后续扩展）。
     RetryExhausted {
         ts: String,
@@ -98,6 +115,13 @@ pub enum AgentEvent {
         duration_ms: u128,
         error: Option<String>,
     },
+    /// 能力缓存重置事件（用于审计“手工重置”的来源）。
+    CapabilityCacheReset {
+        ts: String,
+        provider: Option<String>,
+        model: Option<String>,
+        removed: usize,
+    },
     /// 自动验证开始。
     ValidationStart {
         ts: String,
@@ -125,6 +149,43 @@ tokio::task_local! {
 }
 
 static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static TRACE_ID_FALLBACK: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+/// 获取 trace_id 回退槽位。
+///
+/// 该槽位只用于补偿“task-local 未自动透传到新任务”的场景，
+/// 正常路径仍以 task-local 为准。
+fn trace_id_fallback_slot() -> &'static RwLock<Option<String>> {
+    TRACE_ID_FALLBACK.get_or_init(|| RwLock::new(None))
+}
+
+/// 在 `with_trace_id` 生命周期内维护“请求级回退 trace_id”。
+///
+/// 设计原因：
+/// - 某些 SDK/tool server 会在内部 `tokio::spawn` 新任务；
+/// - `task_local` 默认不会跨任务自动继承，导致工具侧拿不到 trace_id；
+/// - 用回退槽位可保证同一请求内仍能关联到正确 trace_id。
+struct TraceIdFallbackGuard {
+    previous: Option<String>,
+}
+
+impl TraceIdFallbackGuard {
+    fn install(current: &str) -> Self {
+        let slot = trace_id_fallback_slot();
+        let mut guard = slot.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = guard.clone();
+        *guard = Some(current.to_string());
+        Self { previous }
+    }
+}
+
+impl Drop for TraceIdFallbackGuard {
+    fn drop(&mut self) {
+        let slot = trace_id_fallback_slot();
+        let mut guard = slot.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = self.previous.clone();
+    }
+}
 
 /// 生成一个新的 trace_id。
 ///
@@ -141,12 +202,17 @@ pub fn new_trace_id() -> String {
 
 /// 在给定 trace_id 的 scope 内执行异步逻辑。
 pub async fn with_trace_id<T>(trace_id: String, fut: impl std::future::Future<Output = T>) -> T {
+    let _fallback_guard = TraceIdFallbackGuard::install(&trace_id);
     TRACE_ID.scope(trace_id, fut).await
 }
 
 /// 获取当前任务绑定的 trace_id（若不存在则返回 None）。
 pub fn current_trace_id() -> Option<String> {
-    TRACE_ID.try_with(|value| value.clone()).ok()
+    TRACE_ID.try_with(|value| value.clone()).ok().or_else(|| {
+        let slot = trace_id_fallback_slot();
+        let guard = slot.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.clone()
+    })
 }
 
 /// 获取当前时间（本地时区）字符串。
@@ -202,4 +268,44 @@ pub fn ts() -> String {
 /// - 即使用户从子目录启动，日志仍会落到当前目录的 `.order/` 下，避免意外写到系统目录。
 pub fn workspace_root_best_effort() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{current_trace_id, with_trace_id};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_trace_id_should_be_available_in_scope() {
+        let trace_id = "trace-in-scope".to_string();
+        let got = with_trace_id(trace_id.clone(), async { current_trace_id() }).await;
+        assert_eq!(got, Some(trace_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_trace_id_should_fallback_in_spawned_task() {
+        let trace_id = "trace-fallback".to_string();
+        let got = with_trace_id(trace_id.clone(), async {
+            tokio::spawn(async { current_trace_id() })
+                .await
+                .expect("spawned task should finish")
+        })
+        .await;
+        assert_eq!(got, Some(trace_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_trace_id_should_restore_after_nested_scope() {
+        let outer = "trace-outer".to_string();
+        let inner = "trace-inner".to_string();
+
+        with_trace_id(outer.clone(), async {
+            assert_eq!(current_trace_id(), Some(outer.clone()));
+            with_trace_id(inner.clone(), async {
+                assert_eq!(current_trace_id(), Some(inner.clone()));
+            })
+            .await;
+            assert_eq!(current_trace_id(), Some(outer.clone()));
+        })
+        .await;
+    }
 }

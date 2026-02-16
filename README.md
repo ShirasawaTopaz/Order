@@ -52,15 +52,23 @@ cargo check --workspace
 - `/rules`
 - `/settings`
 - `/status`
+- `/capability`
 - `/editor`
 
 其中 `/editor` 可进入内置编辑器视图。
+`/capability` 当前支持缓存重置：
+- `/capability reset`：按当前 provider/model 清理能力缓存。
+- `/capability reset all`：清空 `.order/capabilities.json` 中全部记录。
+- `/capability reset <provider>`：按 provider 清理。
+- `/capability reset <provider> <model>`：按 provider + model 精确清理。
+`/status` 除了近 24h 统计外，还会展示当前生效能力、缓存降级原因与 TTL 状态。
 
 流式与中断说明：
 - 正常发送消息后，响应会以增量方式实时渲染到对话区。
 - 请求进行中可用 `/cancel` 中断；此时 `Ctrl+C` 也会执行“取消请求”，而不是直接退出程序。
 - 当没有进行中的请求时，`Ctrl+C` 仍按原行为退出程序。
 - 流式请求默认带有超时与自动重试（指数退避 + 抖动），仅在“未产出正文增量且判定为可重试错误”时触发，避免重复输出污染会话。
+- 主对话界面默认支持鼠标框选历史文本进行复制；进入 `/editor` 后会临时启用鼠标捕获以支持编辑器交互。
 
 ## 对话上下文
 
@@ -106,16 +114,18 @@ cargo check --workspace
 - `api_url`：可选，自定义 Base URL
 - `token`：可选；为空时会读取对应环境变量
 - `support_tools`：是否启用工具调用（见下）
+- `default_max_turns`：可选；agent 多轮上限（`0` 表示使用系统默认值，当前默认 `12`）
 
 当 `provider` 为 `openai` 或 `codex` 且 `support_tools = true` 时，会启用内置文件工具：
 
 - `ReadTool`：读取工作区内文件（仅相对路径、UTF-8、大小受限）
-- `WriteTool`：写入工作区内文件（仅相对路径、默认写入 LF、大小受限）
-- `SearchFileTool`：在工作区内递归搜索关键字（仅相对路径、结果数量受限）
+- `WriteTool`：写入工作区内文件（仅相对路径、默认写入 LF、大小受限；需要用户确认时会弹出 `同意 / 不同意 / 同意之后一切修改` 三选项，可用 `↑/↓ + Enter` 选择）
+- `SearchFileTool`：在工作区内递归搜索关键字（仅相对路径、结果数量受限，返回可直接传给 `ReadTool` 的相对路径）
 
 补充说明：
 
-- `codex` 在未显式设置 `support_tools` 时默认启用工具调用，可通过显式设置 `support_tools = false` 关闭。
+- `openai` 与 `codex` 在未显式设置 `support_tools` 时默认启用工具调用，可通过显式设置 `support_tools = false` 关闭。
+- 为提升定位源码稳定性，`SearchFileTool` 默认会跳过 `.git`、`target`、`node_modules` 等高噪声目录；如需搜索这些目录，可将 `path` 直接指定为该目录本身。
 
 ## LSP 能力说明
 

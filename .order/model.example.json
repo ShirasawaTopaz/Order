@@ -7,7 +7,8 @@
     "support_tools": true,
     "model_max_context": 0,
     "model_max_output": 0,
-    "model_max_tokens": 0
+    "model_max_tokens": 0,
+    "default_max_turns": 12
   },
   "models": [
     {
@@ -18,7 +19,8 @@
       "support_tools": false,
       "model_max_context": 0,
       "model_max_output": 0,
-      "model_max_tokens": 0
+      "model_max_tokens": 0,
+      "default_max_turns": 0
     }
   ]
 }

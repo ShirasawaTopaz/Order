@@ -19,6 +19,23 @@ const MAX_MEMORY_ITEMS: usize = 40;
 const MEMORY_SCAN_LIMIT: usize = 24;
 /// 为防止预算过小导致上下文几乎为空，输入预算会有一个下限。
 const MIN_CONTEXT_BUDGET: u32 = 512;
+/// 需要从长期记忆中剔除的“低信号元话术”前缀。
+///
+/// 这些文本通常是助手的阶段性承诺或流程反馈，不是稳定规则/偏好/决策，
+/// 若反复注入会诱导模型持续“先口头确认、再承诺后续动作”。
+const LOW_SIGNAL_MEMORY_PREFIXES: [&str; 11] = [
+    "收到",
+    "好的",
+    "已确认",
+    "我已确认",
+    "我已经",
+    "我会",
+    "我将",
+    "我建议",
+    "我刚刚",
+    "我先",
+    "下一步",
+];
 
 /// 上下文消息角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,10 +254,17 @@ impl ContextManager {
     pub fn new() -> Self {
         let task_id = resolve_task_id();
         let memory_path = resolve_memory_path();
-        let memory_file = read_memory_file(&memory_path).unwrap_or_else(|error| {
+        let mut memory_file = read_memory_file(&memory_path).unwrap_or_else(|error| {
             eprintln!("failed to load context memory, fallback to empty: {error}");
             ContextMemoryFile::default()
         });
+        // 启动时做一次轻量清理，自动剔除历史遗留的低信号元话术，
+        // 防止旧版本写入的“承诺式文本”持续污染后续上下文。
+        if sanitize_memory_file(&mut memory_file)
+            && let Err(error) = write_memory_file(&memory_path, &memory_file)
+        {
+            eprintln!("failed to sanitize context memory, keep in-memory result only: {error}");
+        }
 
         Self {
             task_id,
@@ -427,7 +451,15 @@ fn filter_messages_for_llm(messages: &[ContextMessage], current_prompt: &str) ->
 
             match message.role {
                 ContextRole::User => Some(ContextEntry::user(content.to_string())),
-                ContextRole::Assistant => Some(ContextEntry::assistant(content.to_string())),
+                ContextRole::Assistant => {
+                    // 对“只承诺下一步、无实际产出”的助手回复做降噪，
+                    // 避免该类文本在短期上下文中被反复强化，形成“只说不做”回环。
+                    if is_non_executing_commitment_message(content) {
+                        None
+                    } else {
+                        Some(ContextEntry::assistant(content.to_string()))
+                    }
+                }
                 ContextRole::Error => None,
             }
         })
@@ -542,15 +574,9 @@ fn build_long_term_memory_prompt(
 ) -> Option<String> {
     let mut lines = Vec::new();
 
-    for item in task_memory.project_rules.iter().rev().take(4) {
-        lines.push(format!("- 规则：{}", item));
-    }
-    for item in task_memory.preferences.iter().rev().take(4) {
-        lines.push(format!("- 偏好：{}", item));
-    }
-    for item in task_memory.key_decisions.iter().rev().take(4) {
-        lines.push(format!("- 决策：{}", item));
-    }
+    append_memory_items(&mut lines, "规则", &task_memory.project_rules, 4);
+    append_memory_items(&mut lines, "偏好", &task_memory.preferences, 4);
+    append_memory_items(&mut lines, "决策", &task_memory.key_decisions, 4);
 
     if lines.is_empty() {
         return None;
@@ -647,13 +673,17 @@ fn extract_memory_candidates(messages: &[ContextMessage]) -> Vec<(MemoryCategory
     let mut result = Vec::new();
 
     for message in &messages[start..] {
-        if !message.persist_to_history || matches!(message.role, ContextRole::Error) {
+        // 长期记忆只采集用户输入，避免把助手的“阶段性承诺/流程话术”写回并自我强化。
+        if !message.persist_to_history || !matches!(message.role, ContextRole::User) {
             continue;
         }
 
         for raw_line in message.content.lines() {
             let line = normalize_text(raw_line);
             if line.chars().count() < 6 {
+                continue;
+            }
+            if is_low_signal_memory_item(&line) {
                 continue;
             }
 
@@ -685,6 +715,38 @@ fn deduplicate_candidates(
     }
 
     deduped
+}
+
+/// 清理长期记忆中的低信号条目。
+///
+/// 返回值表示是否发生了修改，便于调用方决定是否回写到磁盘。
+fn sanitize_memory_file(file: &mut ContextMemoryFile) -> bool {
+    let mut changed = false;
+    for task_memory in file.tasks.values_mut() {
+        changed |= retain_high_signal_items(&mut task_memory.project_rules);
+        changed |= retain_high_signal_items(&mut task_memory.preferences);
+        changed |= retain_high_signal_items(&mut task_memory.key_decisions);
+    }
+    changed
+}
+
+/// 原地保留高信号条目。
+fn retain_high_signal_items(items: &mut Vec<String>) -> bool {
+    let before = items.len();
+    items.retain(|item| !is_low_signal_memory_item(item));
+    before != items.len()
+}
+
+/// 向长期记忆提示中追加高信号条目。
+fn append_memory_items(lines: &mut Vec<String>, label: &str, items: &[String], max_items: usize) {
+    for item in items
+        .iter()
+        .rev()
+        .filter(|item| !is_low_signal_memory_item(item))
+        .take(max_items)
+    {
+        lines.push(format!("- {}：{}", label, item));
+    }
 }
 
 /// 识别文本对应的长期记忆分类。
@@ -732,6 +794,82 @@ fn contains_any_keyword(text: &str, keywords: &[&str]) -> bool {
 /// 规范化文本，减少去重误判。
 fn normalize_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 判断是否属于不应进入长期记忆的低信号文本。
+///
+/// 过滤目标是“过程状态”而非“稳定事实”，例如：
+/// - 助手承诺下一步动作；
+/// - 对方案/流程的礼貌确认；
+/// - 一次性阶段汇报。
+fn is_low_signal_memory_item(text: &str) -> bool {
+    let normalized = normalize_text(text);
+    if normalized.is_empty() {
+        return true;
+    }
+
+    if LOW_SIGNAL_MEMORY_PREFIXES
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+    {
+        return true;
+    }
+
+    contains_any_keyword(
+        &normalized,
+        &[
+            "提交第一批补丁",
+            "进入实现阶段",
+            "完成入口定位",
+            "按既定方案继续",
+            "我会继续",
+            "关键改动点都在仓库里可定位",
+        ],
+    )
+}
+
+/// 判断助手消息是否属于“仅承诺下一步、没有实际执行结果”的低价值上下文。
+///
+/// 该规则只用于上下文降噪，不用于业务正确性判断：
+/// - 若消息包含明确执行结果（如“已修改/已完成/测试通过”），则保留；
+/// - 若主要是阶段计划与承诺语句，则在后续轮次中剔除，降低复读风险。
+fn is_non_executing_commitment_message(text: &str) -> bool {
+    let normalized = normalize_text(text);
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let has_commitment_phrase = contains_any_keyword(
+        &normalized,
+        &[
+            "我会按",
+            "我会继续",
+            "接下来我将",
+            "我现在就开始",
+            "开始进入实现阶段",
+            "第一步",
+            "第二步",
+            "提交第一批补丁",
+            "确认关键改动点",
+        ],
+    );
+    if !has_commitment_phrase {
+        return false;
+    }
+
+    !contains_any_keyword(
+        &normalized,
+        &[
+            "已修改",
+            "已完成",
+            "已实现",
+            "测试通过",
+            "测试失败",
+            ".rs",
+            ".toml",
+            "trace_id=",
+        ],
+    )
 }
 
 /// 按字符上限截断文本。
@@ -851,6 +989,7 @@ fn first_non_empty_env(keys: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn context_message(
@@ -939,9 +1078,10 @@ mod tests {
             ContextManager::new_for_test("task-c", path.clone(), ContextCompressor::default());
         let messages = vec![
             context_message(ContextRole::User, "必须使用 UTF-8 编码", true),
-            context_message(ContextRole::Assistant, "建议优先修复根因", true),
-            context_message(ContextRole::Assistant, "最终决定采用最小改动方案", true),
-            context_message(ContextRole::Assistant, "最终决定采用最小改动方案", true),
+            context_message(ContextRole::User, "用户偏好：优先修复根因", true),
+            context_message(ContextRole::User, "最终决定采用最小改动方案", true),
+            context_message(ContextRole::User, "最终决定采用最小改动方案", true),
+            context_message(ContextRole::Assistant, "已确认，我会继续按既定方案提交第一批补丁", true),
         ];
 
         manager
@@ -959,5 +1099,120 @@ mod tests {
         assert_eq!(task_memory.project_rules.len(), 1);
         assert_eq!(task_memory.preferences.len(), 1);
         assert_eq!(task_memory.key_decisions.len(), 1);
+    }
+
+    #[test]
+    fn update_long_term_memory_should_ignore_assistant_meta_talk() {
+        let mut manager = ContextManager::new_for_test(
+            "task-d",
+            temp_memory_path(),
+            ContextCompressor::default(),
+        );
+        let messages = vec![
+            context_message(
+                ContextRole::Assistant,
+                "我会继续按既定方案提交第一批补丁",
+                true,
+            ),
+            context_message(
+                ContextRole::Assistant,
+                "好的，收到“同意”，下一步进入实现阶段",
+                true,
+            ),
+        ];
+
+        manager
+            .update_long_term_memory(&messages)
+            .expect("assistant meta talk should be ignored without error");
+
+        assert!(
+            manager.memory_file.tasks.get("task-d").is_none(),
+            "仅有助手元话术时不应写入长期记忆"
+        );
+    }
+
+    #[test]
+    fn build_long_term_memory_prompt_should_skip_low_signal_items() {
+        let task_memory = TaskMemory {
+            project_rules: vec![
+                "必须使用 UTF-8 编码".to_string(),
+                "已确认，我会继续按既定方案提交第一批补丁".to_string(),
+            ],
+            preferences: vec![
+                "用户偏好：优先修复根因".to_string(),
+                "我建议下一步进入实现阶段".to_string(),
+            ],
+            key_decisions: vec![
+                "最终决定采用最小改动方案".to_string(),
+                "我会继续按既定方案提交第一批补丁".to_string(),
+            ],
+            updated_at: String::new(),
+        };
+
+        let prompt = build_long_term_memory_prompt("task-e", &task_memory, 1200)
+            .expect("high-signal memory should still generate prompt");
+
+        assert!(prompt.contains("必须使用 UTF-8 编码"));
+        assert!(prompt.contains("用户偏好：优先修复根因"));
+        assert!(prompt.contains("最终决定采用最小改动方案"));
+        assert!(!prompt.contains("提交第一批补丁"));
+        assert!(!prompt.contains("进入实现阶段"));
+    }
+
+    #[test]
+    fn sanitize_memory_file_should_remove_low_signal_items() {
+        let mut file = ContextMemoryFile {
+            tasks: HashMap::from([(
+                "task-f".to_string(),
+                TaskMemory {
+                    project_rules: vec![
+                        "必须使用 UTF-8 编码".to_string(),
+                        "收到，我会继续按既定方案提交第一批补丁".to_string(),
+                    ],
+                    preferences: vec!["用户偏好：优先修复根因".to_string()],
+                    key_decisions: vec![
+                        "最终决定采用最小改动方案".to_string(),
+                        "下一步进入实现阶段".to_string(),
+                    ],
+                    updated_at: String::new(),
+                },
+            )]),
+        };
+
+        let changed = sanitize_memory_file(&mut file);
+        assert!(changed);
+
+        let task = file
+            .tasks
+            .get("task-f")
+            .expect("task-f should exist after sanitize");
+        assert_eq!(task.project_rules, vec!["必须使用 UTF-8 编码".to_string()]);
+        assert_eq!(task.preferences, vec!["用户偏好：优先修复根因".to_string()]);
+        assert_eq!(
+            task.key_decisions,
+            vec!["最终决定采用最小改动方案".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_history_should_skip_non_executing_commitment_assistant_message() {
+        let manager = ContextManager::new_for_test(
+            "task-g",
+            temp_memory_path(),
+            ContextCompressor::default(),
+        );
+        let messages = vec![
+            context_message(ContextRole::User, "请实现 usage 成本统计", true),
+            context_message(
+                ContextRole::Assistant,
+                "收到，我会按你这版方案直接落地。接下来我将分两步推进，第一步先提交第一批补丁。",
+                true,
+            ),
+            context_message(ContextRole::User, "继续", true),
+        ];
+
+        let result = manager.build_history("继续", &messages, ContextModelLimits::default());
+        assert_eq!(result.history.len(), 1, "应剔除仅承诺型助手消息");
+        assert_eq!(result.history[0], RigMessage::user("请实现 usage 成本统计"));
     }
 }

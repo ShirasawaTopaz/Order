@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::VecDeque, path::Path};
 
 use rig::{completion::ToolDefinition, tool::Tool};
 use serde::{Deserialize, Serialize};
@@ -11,8 +11,26 @@ use crate::observability::{
 
 use super::workspace::{
     MAX_SEARCH_FILE_BYTES, MAX_SEARCH_FILES, MAX_SEARCH_RESULTS,
-    ensure_no_symlink_in_existing_path, resolve_workspace_relative_path, workspace_root,
+    ensure_no_symlink_in_existing_path, format_workspace_relative_path,
+    resolve_workspace_relative_path, workspace_root,
 };
+
+/// 默认跳过的目录名（仅在递归搜索时生效）。
+///
+/// 这些目录通常体积大、噪声高或包含构建产物，默认搜索它们会让模型更难快速定位源码。
+const DEFAULT_IGNORED_DIR_NAMES: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".order",
+    "target",
+    "node_modules",
+    ".next",
+    ".turbo",
+    "dist",
+    "build",
+    "out",
+];
 
 #[derive(Clone, Deserialize)]
 pub struct SearchFileToolArgs {
@@ -98,9 +116,16 @@ impl Tool for SearchFileTool {
                 ));
             }
 
+            // path 为空时回退到当前工作区根目录，提升模型工具调用的容错能力。
+            let normalized_path = if args.path.trim().is_empty() {
+                "."
+            } else {
+                args.path.trim()
+            };
+
             // 通过“工作区内相对路径”约束搜索范围，避免递归扫描到工作区外部目录。
             let workspace_root = workspace_root().map_err(SearchFileToolError::Other)?;
-            let root = resolve_workspace_relative_path(&workspace_root, &args.path)
+            let root = resolve_workspace_relative_path(&workspace_root, normalized_path)
                 .map_err(SearchFileToolError::Other)?;
             ensure_no_symlink_in_existing_path(&workspace_root, &root)
                 .map_err(SearchFileToolError::Other)?;
@@ -116,14 +141,15 @@ impl Tool for SearchFileTool {
             }
 
             let mut matches = Vec::new();
-            let mut stack = vec![root];
+            let mut pending_dirs = VecDeque::from([root.clone()]);
             let mut scanned_files = 0usize;
             let mut truncated_by_limit = false;
 
-            while let Some(current) = stack.pop() {
+            while let Some(current) = pending_dirs.pop_front() {
                 let mut read_dir = fs::read_dir(&current)
                     .await
                     .map_err(SearchFileToolError::IoError)?;
+                let mut child_dirs = Vec::new();
 
                 while let Some(entry) = read_dir
                     .next_entry()
@@ -142,7 +168,11 @@ impl Tool for SearchFileTool {
                     }
 
                     if file_type.is_dir() {
-                        stack.push(path);
+                        // 跳过典型噪声目录，避免在大仓库里过早耗尽扫描预算。
+                        if should_skip_directory(&root, &path) {
+                            continue;
+                        }
+                        child_dirs.push(path);
                         continue;
                     }
 
@@ -164,7 +194,9 @@ impl Tool for SearchFileTool {
                         continue;
                     }
 
-                    if let Ok(file_matches) = search_in_file(&path, &args.keyword).await {
+                    if let Ok(file_matches) =
+                        search_in_file(&workspace_root, &path, &args.keyword).await
+                    {
                         matches.extend(file_matches);
                         if matches.len() >= MAX_SEARCH_RESULTS {
                             matches.truncate(MAX_SEARCH_RESULTS);
@@ -176,6 +208,12 @@ impl Tool for SearchFileTool {
 
                 if truncated_by_limit {
                     break;
+                }
+
+                // 稳定排序后按 BFS 继续遍历，减少不同平台下搜索结果顺序波动。
+                child_dirs.sort();
+                for directory in child_dirs {
+                    pending_dirs.push_back(directory);
                 }
             }
 
@@ -211,7 +249,11 @@ impl Tool for SearchFileTool {
 /// 在单个文件中搜索关键字，返回匹配行。
 ///
 /// 输出格式：`<path>:<line_number>:<line_content>`。
-async fn search_in_file(path: &Path, keyword: &str) -> Result<Vec<String>, SearchFileToolError> {
+async fn search_in_file(
+    workspace_root: &Path,
+    path: &Path,
+    keyword: &str,
+) -> Result<Vec<String>, SearchFileToolError> {
     let text = match fs::read_to_string(path).await {
         Ok(value) => value,
         Err(error) => {
@@ -223,12 +265,103 @@ async fn search_in_file(path: &Path, keyword: &str) -> Result<Vec<String>, Searc
         }
     };
 
+    // 统一输出工作区相对路径，确保结果可直接用于 `ReadTool/WriteTool`。
+    let display_path =
+        format_workspace_relative_path(workspace_root, path).map_err(SearchFileToolError::Other)?;
+
     let mut result = Vec::new();
     for (index, line) in text.lines().enumerate() {
         if line.contains(keyword) {
-            result.push(format!("{}:{}:{}", path.display(), index + 1, line));
+            result.push(format!("{display_path}:{}:{}", index + 1, line));
         }
     }
 
     Ok(result)
+}
+
+/// 判断目录是否属于默认噪声目录。
+///
+/// 仅跳过“搜索根目录之下的子目录”，若用户显式把根目录设置为噪声目录本身，仍允许搜索。
+fn should_skip_directory(search_root: &Path, candidate: &Path) -> bool {
+    if candidate == search_root {
+        return false;
+    }
+
+    let Some(name) = candidate.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+
+    is_default_ignored_directory_name(name)
+}
+
+fn is_default_ignored_directory_name(name: &str) -> bool {
+    DEFAULT_IGNORED_DIR_NAMES
+        .iter()
+        .any(|ignored| ignored.eq_ignore_ascii_case(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use tokio::fs;
+
+    use super::{is_default_ignored_directory_name, search_in_file, should_skip_directory};
+
+    #[test]
+    fn should_skip_directory_should_skip_target_under_workspace() {
+        let root = Path::new("D:/order");
+        let target = Path::new("D:/order/target");
+        assert!(should_skip_directory(root, target));
+    }
+
+    #[test]
+    fn should_skip_directory_should_not_skip_when_root_itself_is_target() {
+        let root = Path::new("D:/order/target");
+        assert!(!should_skip_directory(root, root));
+    }
+
+    #[test]
+    fn is_default_ignored_directory_name_should_be_case_insensitive() {
+        assert!(is_default_ignored_directory_name("TARGET"));
+        assert!(is_default_ignored_directory_name(".Git"));
+        assert!(!is_default_ignored_directory_name("crates"));
+    }
+
+    #[tokio::test]
+    async fn search_in_file_should_emit_workspace_relative_path() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("order-search-tool-{suffix}"));
+        let source_dir = root.join("src");
+        let file_path = source_dir.join("main.rs");
+
+        fs::create_dir_all(&source_dir)
+            .await
+            .expect("temp source dir should be creatable");
+        fs::write(
+            &file_path,
+            "fn main() {\n    println!(\"hello from search tool\");\n}\n",
+        )
+        .await
+        .expect("temp source file should be writable");
+
+        let matches = search_in_file(&root, &file_path, "println!")
+            .await
+            .expect("search should succeed for utf-8 file");
+        assert_eq!(matches.len(), 1);
+        assert!(
+            matches[0].starts_with("src/main.rs:2:"),
+            "match line should start with relative path and line number, got: {}",
+            matches[0]
+        );
+
+        // 测试完成后清理临时目录，避免污染系统临时空间。
+        let _ = fs::remove_dir_all(&root).await;
+    }
 }
