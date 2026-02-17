@@ -172,7 +172,9 @@ struct TraceIdFallbackGuard {
 impl TraceIdFallbackGuard {
     fn install(current: &str) -> Self {
         let slot = trace_id_fallback_slot();
-        let mut guard = slot.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = slot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = guard.clone();
         *guard = Some(current.to_string());
         Self { previous }
@@ -182,7 +184,9 @@ impl TraceIdFallbackGuard {
 impl Drop for TraceIdFallbackGuard {
     fn drop(&mut self) {
         let slot = trace_id_fallback_slot();
-        let mut guard = slot.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = slot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = self.previous.clone();
     }
 }
