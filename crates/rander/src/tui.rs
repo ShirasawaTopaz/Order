@@ -1009,10 +1009,23 @@ impl OrderTui<'_> {
         let guard = ExecutionGuard::default();
         match guard.apply_pending_writes(trace_id) {
             Ok(result) => {
+                let snapshot_status_line = if !result.snapshot_retained {
+                    format!(
+                        "快照状态：已自动清理 `.order/snapshots/{}`（避免历史副本残留）",
+                        result.trace_id
+                    )
+                } else if let Some(error) = result.snapshot_cleanup_error.as_ref() {
+                    format!("快照状态：保留（自动清理失败：{error}）")
+                } else {
+                    format!(
+                        "快照状态：已保留 `.order/snapshots/{}`（可用 /rollback 回滚）",
+                        result.trace_id
+                    )
+                };
                 self.push_chat_message(
                     ChatRole::Llm,
                     format!(
-                        "已确认写入（trace_id={}），影响文件数={}：\n{}",
+                        "已确认写入（trace_id={}），影响文件数={}：\n{}\n{}",
                         result.trace_id,
                         result.files.len(),
                         result
@@ -1020,7 +1033,8 @@ impl OrderTui<'_> {
                             .iter()
                             .map(|path| format!("- {path}"))
                             .collect::<Vec<_>>()
-                            .join("\n")
+                            .join("\n"),
+                        snapshot_status_line
                     ),
                     false,
                 );
@@ -1384,9 +1398,15 @@ impl OrderTui<'_> {
     fn start_streaming_completion(&mut self, prompt: String) -> anyhow::Result<()> {
         self.ensure_connection()?;
         let chat_history = self.build_chat_history_for_llm(&prompt);
-        let enforce_tool_execution = Self::looks_like_code_change_request(&prompt);
-        let require_write_tool = Self::should_require_write_tool(&prompt);
-        let request_prompt = Self::prepare_request_prompt(&prompt, require_write_tool);
+        // 对“1/继续/同意”等短回复做上下文补全：
+        // 若上一轮助手仍在等待写入决策，则本轮继续按“必须落工具”执行，避免反复口头承诺。
+        let follow_up_requires_write = self.should_force_write_tool_on_follow_up(&prompt);
+        let enforce_tool_execution =
+            Self::looks_like_code_change_request(&prompt) || follow_up_requires_write;
+        let require_write_tool =
+            Self::should_require_write_tool(&prompt) || follow_up_requires_write;
+        let request_prompt =
+            Self::prepare_request_prompt(&prompt, enforce_tool_execution, require_write_tool);
         let connection = self
             .connection
             .as_ref()
@@ -1538,13 +1558,36 @@ impl OrderTui<'_> {
                 Ok(Ok(response)) => {
                     let tool_called = emitted_tool_progress.load(Ordering::Relaxed);
                     let write_tool_called = emitted_write_tool.load(Ordering::Relaxed);
+                    let pending_write_count = if require_write_tool {
+                        match Self::count_pending_writes(&trace_id) {
+                            Ok(count) => count,
+                            Err(error) => {
+                                // 读取 pending 失败时按“未形成可审批写入”处理，避免误判为已完成写入。
+                                let _ = sender.send(CompletionWorkerEvent::Stream(
+                                    ModelStreamEvent::ToolProgress {
+                                        message: format!(
+                                            "读取待确认写入失败，将按未写入处理：{}",
+                                            shorten_reason(&error.to_string(), 80)
+                                        ),
+                                    },
+                                ));
+                                0
+                            }
+                        }
+                    } else {
+                        0
+                    };
                     let missed_tool_execution = enforce_tool_execution && !tool_called;
-                    let missed_write_execution = require_write_tool && !write_tool_called;
+                    let missed_write_execution =
+                        Self::is_write_execution_missing(require_write_tool, pending_write_count);
 
                     if missed_tool_execution || missed_write_execution {
                         if attempt < MAX_ATTEMPTS {
                             let reason = if missed_write_execution {
-                                "未调用 WriteTool"
+                                Self::describe_missing_write_execution(
+                                    write_tool_called,
+                                    pending_write_count,
+                                )
                             } else {
                                 "未执行任何工具调用"
                             };
@@ -1561,16 +1604,20 @@ impl OrderTui<'_> {
                             continue;
                         }
 
-                        let fallback_hint = if Self::is_non_executing_commitment_response(&response.content) {
-                            "（检测到承诺式文本）"
-                        } else {
-                            ""
-                        };
+                        let fallback_hint =
+                            if Self::is_non_executing_commitment_response(&response.content) {
+                                "（检测到承诺式文本）"
+                            } else {
+                                ""
+                            };
                         return Err(anyhow!(
                             "模型未满足执行约束{}：{}",
                             fallback_hint,
                             if missed_write_execution {
-                                "本轮未调用 WriteTool 暂存补丁"
+                                Self::describe_missing_write_execution(
+                                    write_tool_called,
+                                    pending_write_count,
+                                )
                             } else {
                                 "本轮未触发任何工具调用"
                             }
@@ -1623,17 +1670,19 @@ impl OrderTui<'_> {
 
     /// 构造实际发送给模型的请求文本。
     ///
-    /// 仅当识别为“代码变更请求”时追加执行约束，避免影响普通问答体验。
-    fn prepare_request_prompt(prompt: &str, require_write_tool: bool) -> String {
-        if Self::looks_like_code_change_request(prompt) {
-            if require_write_tool {
-                return format!(
-                    "{prompt}{EXECUTION_ENFORCER_SUFFIX}{WRITE_EXECUTION_ENFORCER_SUFFIX}"
-                );
-            }
-            return format!("{prompt}{EXECUTION_ENFORCER_SUFFIX}");
+    /// 仅在“需要工具执行”时追加约束，避免影响普通问答体验。
+    fn prepare_request_prompt(
+        prompt: &str,
+        enforce_tool_execution: bool,
+        require_write_tool: bool,
+    ) -> String {
+        if !enforce_tool_execution {
+            return prompt.to_string();
         }
-        prompt.to_string()
+        if require_write_tool {
+            return format!("{prompt}{EXECUTION_ENFORCER_SUFFIX}{WRITE_EXECUTION_ENFORCER_SUFFIX}");
+        }
+        format!("{prompt}{EXECUTION_ENFORCER_SUFFIX}")
     }
 
     /// 识别输入是否属于“应直接落代码”的请求。
@@ -1642,9 +1691,28 @@ impl OrderTui<'_> {
     fn looks_like_code_change_request(prompt: &str) -> bool {
         let normalized = prompt.to_ascii_lowercase();
         let keywords = [
-            "修复", "实现", "修改", "改动", "新增", "重构", "补丁", "写入文件", "改代码",
-            "fix", "implement", "modify", "refactor", "patch", "write", "edit",
-            "code", "bug", ".rs", "crates/", "cargo", "todo.md",
+            "修复",
+            "实现",
+            "修改",
+            "改动",
+            "新增",
+            "重构",
+            "补丁",
+            "写入文件",
+            "改代码",
+            "fix",
+            "implement",
+            "modify",
+            "refactor",
+            "patch",
+            "write",
+            "edit",
+            "code",
+            "bug",
+            ".rs",
+            "crates/",
+            "cargo",
+            "todo.md",
         ];
         keywords
             .iter()
@@ -1659,11 +1727,19 @@ impl OrderTui<'_> {
             "补丁",
             "改代码",
             "改文件",
+            "写代码",
             "直接改",
             "落盘",
+            "落地",
+            "改造",
+            "补强",
+            "重写",
+            "引入",
             "修复",
             "实现",
             "修改",
+            "提交补丁",
+            "更新代码",
             "write patch",
             "apply patch",
             "edit file",
@@ -1673,6 +1749,195 @@ impl OrderTui<'_> {
         ]
         .iter()
         .any(|keyword| prompt.contains(keyword) || normalized.contains(keyword))
+    }
+
+    /// 判断“简短跟进回复”是否应延续上一轮的写入执行约束。
+    ///
+    /// 典型场景：上一轮助手输出“回复 1/2 决策”或“我会继续执行”等承诺，
+    /// 用户回“1”/“继续”后应直接进入工具执行，而不是再次追问。
+    fn should_force_write_tool_on_follow_up(&self, prompt: &str) -> bool {
+        if !Self::is_short_follow_up_prompt(prompt) {
+            return false;
+        }
+
+        let Some(last_llm_message) = self.last_llm_message_content() else {
+            return false;
+        };
+        let assistant_waiting_for_execution =
+            Self::is_non_executing_commitment_response(last_llm_message)
+                || Self::contains_write_decision_prompt(last_llm_message);
+        if !assistant_waiting_for_execution {
+            return false;
+        }
+
+        // 若上一轮助手已经明确提到写入/补丁/WriteTool，则即便用户最初描述较弱，
+        // 这一轮“同意/继续”也应直接进入真实工具执行，避免再次退化为口头承诺。
+        if Self::contains_explicit_write_signal(last_llm_message) {
+            return true;
+        }
+
+        // 兜底：若助手文案不够明确，则依赖最近用户消息判断是否属于代码改动上下文。
+        self.has_recent_user_write_intent()
+    }
+
+    /// 判断输入是否属于“继续执行”类短回复。
+    ///
+    /// 仅在短文本上触发，避免把长文本误判为确认指令。
+    fn is_short_follow_up_prompt(prompt: &str) -> bool {
+        let trimmed = prompt.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let normalized = trimmed.to_ascii_lowercase();
+        let compact = normalized
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>();
+        let compact_chars = compact.chars().count();
+        if compact_chars > 16 {
+            return false;
+        }
+
+        [
+            "1",
+            "2",
+            "3",
+            "继续",
+            "继续执行",
+            "同意",
+            "不同意",
+            "确认",
+            "好的",
+            "开始",
+            "执行",
+            "按1",
+            "按2",
+            "方案1",
+            "方案2",
+            "ok",
+            "yes",
+            "go",
+            "goon",
+            "continue",
+            "proceed",
+        ]
+        .iter()
+        .any(|keyword| compact == *keyword)
+    }
+
+    /// 从最近消息中判断用户是否刚发起过“需要改代码”的目标。
+    fn has_recent_user_write_intent(&self) -> bool {
+        self.messages
+            .iter()
+            .rev()
+            .filter(|message| matches!(message.role, ChatRole::User))
+            .take(6)
+            .any(|message| {
+                Self::should_require_write_tool(&message.content)
+                    || Self::looks_like_code_change_request(&message.content)
+            })
+    }
+
+    /// 读取最近一条助手消息正文。
+    fn last_llm_message_content(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, ChatRole::Llm))
+            .map(|message| message.content.as_str())
+    }
+
+    /// 识别助手是否在请求“写入决策/方案选择”。
+    ///
+    /// 这些文案意味着下一条用户短回复通常是“继续执行信号”，应触发真实工具调用。
+    fn contains_write_decision_prompt(message: &str) -> bool {
+        let normalized = message.to_ascii_lowercase();
+        [
+            "如果你同意",
+            "回复“1”",
+            "回复\"1\"",
+            "回“1”",
+            "回\"1\"",
+            "回复任一",
+            "你若回",
+            "方案 1",
+            "方案1",
+            "方案 2",
+            "方案2",
+            "整文件替换",
+            "高风险",
+            "不再来回确认",
+            "option 1",
+            "option 2",
+            "reply 1",
+            "reply with 1",
+            "allow me",
+        ]
+        .iter()
+        .any(|keyword| message.contains(keyword) || normalized.contains(keyword))
+    }
+
+    /// 判断助手文本中是否出现“明确写入执行信号”。
+    ///
+    /// 这类信号通常意味着模型已经承诺要落代码（但尚未执行），
+    /// 用户下一条短回复应被视为“执行指令”而非普通聊天。
+    fn contains_explicit_write_signal(message: &str) -> bool {
+        let normalized = message.to_ascii_lowercase();
+        [
+            "writetool",
+            "写入",
+            "补丁",
+            "改动",
+            "修改",
+            "改代码",
+            "改文件",
+            "落盘",
+            "提交补丁",
+            "apply patch",
+            "edit file",
+            ".rs",
+            "crates/",
+            "/approve",
+            "/reject",
+            "trace_id",
+            "cargo test",
+        ]
+        .iter()
+        .any(|keyword| message.contains(keyword) || normalized.contains(keyword))
+    }
+
+    /// 判断“要求写入”的请求是否真正完成了可审批写入。
+    ///
+    /// 仅调用 `WriteTool` 还不够：如果写入被策略拒绝且没有 pending 记录，
+    /// 最终也不会出现同意/不同意选择框，因此应继续触发重试。
+    fn is_write_execution_missing(require_write_tool: bool, pending_write_count: usize) -> bool {
+        require_write_tool && pending_write_count == 0
+    }
+
+    /// 生成“写入未完成”原因文案，便于在重试日志和最终报错里给出可操作提示。
+    fn describe_missing_write_execution(
+        write_tool_called: bool,
+        pending_write_count: usize,
+    ) -> &'static str {
+        if pending_write_count > 0 {
+            return "写入已生成待确认记录";
+        }
+        if !write_tool_called {
+            return "未调用 WriteTool";
+        }
+        "WriteTool 未生成待确认写入（可能被安全策略拒绝）"
+    }
+
+    /// 读取某次 trace 当前已暂存的待确认写入条目数量。
+    ///
+    /// 这里使用条目数量而不是工具日志文本，避免把“调用成功但写入被拒绝”的场景误判为可审批状态。
+    fn count_pending_writes(trace_id: &str) -> anyhow::Result<usize> {
+        let guard = ExecutionGuard::default();
+        let summaries = guard
+            .list_pending_writes(trace_id)
+            .with_context(|| format!("读取待确认写入失败: trace_id={trace_id}"))?;
+        Ok(summaries.len())
     }
 
     /// 判断回复是否属于“无执行结果的承诺性文本”。
@@ -3143,7 +3408,7 @@ mod tests {
     #[test]
     fn prepare_request_prompt_should_append_enforcer_for_code_change_request() {
         let prompt = "请修复 connection.rs 里的重试逻辑";
-        let prepared = OrderTui::prepare_request_prompt(prompt, true);
+        let prepared = OrderTui::prepare_request_prompt(prompt, true, true);
         assert!(prepared.starts_with(prompt));
         assert!(prepared.contains("[执行约束]"));
         assert!(prepared.contains("WriteTool"));
@@ -3153,7 +3418,7 @@ mod tests {
     #[test]
     fn prepare_request_prompt_should_keep_plain_prompt_for_non_code_request() {
         let prompt = "帮我总结今天的开发进度";
-        let prepared = OrderTui::prepare_request_prompt(prompt, false);
+        let prepared = OrderTui::prepare_request_prompt(prompt, false, false);
         assert_eq!(prepared, prompt);
     }
 
@@ -3162,9 +3427,84 @@ mod tests {
         assert!(OrderTui::should_require_write_tool(
             "请直接写入补丁并修改 connection.rs"
         ));
+        assert!(OrderTui::should_require_write_tool(
+            "请在 history.rs 引入 TokenEstimator 并落地两阶段预算"
+        ));
         assert!(!OrderTui::should_require_write_tool(
             "请解释一下当前架构设计"
         ));
+    }
+
+    #[test]
+    fn should_force_write_tool_on_follow_up_should_match_choice_reply() {
+        let mut tui = OrderTui::default();
+        tui.messages.push(chat_message(
+            ChatRole::User,
+            "修复 history.rs 并直接写入补丁",
+            true,
+        ));
+        tui.messages.push(chat_message(
+            ChatRole::Llm,
+            "你若回“1”或“2”，我下一条直接写入并跑测试，不再来回确认。",
+            false,
+        ));
+
+        assert!(tui.should_force_write_tool_on_follow_up("1"));
+        assert!(tui.should_force_write_tool_on_follow_up("继续"));
+    }
+
+    #[test]
+    fn should_force_write_tool_on_follow_up_should_ignore_non_code_context() {
+        let mut tui = OrderTui::default();
+        tui.messages
+            .push(chat_message(ChatRole::User, "帮我总结 README", true));
+        tui.messages.push(chat_message(
+            ChatRole::Llm,
+            "你若回“1”或“2”，我就按你选的方式继续说明。",
+            false,
+        ));
+
+        assert!(!tui.should_force_write_tool_on_follow_up("1"));
+    }
+
+    #[test]
+    fn should_force_write_tool_on_follow_up_should_match_write_tool_commitment_even_without_user_keywords()
+     {
+        let mut tui = OrderTui::default();
+        tui.messages
+            .push(chat_message(ChatRole::User, "按这个做", true));
+        tui.messages.push(chat_message(
+            ChatRole::Llm,
+            "已确认并读取目标实现文件：crates/rander/src/history.rs。\
+             但我这轮还未提交 WriteTool 改动。\
+             如果你同意，我下一步将直接按最小风险分块写入并提交补丁。",
+            false,
+        ));
+
+        assert!(tui.should_force_write_tool_on_follow_up("同意"));
+        assert!(tui.should_force_write_tool_on_follow_up("继续"));
+    }
+
+    #[test]
+    fn is_write_execution_missing_should_require_pending_records() {
+        assert!(OrderTui::is_write_execution_missing(true, 0));
+    }
+
+    #[test]
+    fn is_write_execution_missing_should_pass_when_pending_exists() {
+        assert!(!OrderTui::is_write_execution_missing(true, 1));
+    }
+
+    #[test]
+    fn describe_missing_write_execution_should_explain_missing_pending_case() {
+        assert_eq!(
+            OrderTui::describe_missing_write_execution(true, 0),
+            "WriteTool 未生成待确认写入（可能被安全策略拒绝）"
+        );
+        assert_eq!(
+            OrderTui::describe_missing_write_execution(false, 0),
+            "未调用 WriteTool"
+        );
     }
 
     #[test]

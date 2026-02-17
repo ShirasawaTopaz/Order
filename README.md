@@ -120,6 +120,7 @@ cargo check --workspace
 
 - `ReadTool`：读取工作区内文件（仅相对路径、UTF-8、大小受限）
 - `WriteTool`：写入工作区内文件（仅相对路径、默认写入 LF、大小受限；需要用户确认时会弹出 `同意 / 不同意 / 同意之后一切修改` 三选项，可用 `↑/↓ + Enter` 选择）
+  - 默认在写入成功后自动清理 `.order/snapshots/<trace_id>` 的代码副本；如需保留快照用于 `/rollback`，可设置 `ORDER_KEEP_SNAPSHOTS=1`
 - `SearchFileTool`：在工作区内递归搜索关键字（仅相对路径、结果数量受限，返回可直接传给 `ReadTool` 的相对路径）
 - `CommandTool`：在工作区根目录执行终端命令（支持超时控制，返回退出码 + stdout/stderr，输出过长时会截断）
 

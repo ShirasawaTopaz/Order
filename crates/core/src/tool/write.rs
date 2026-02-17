@@ -126,9 +126,15 @@ impl Tool for WriteTool {
             })?;
 
             let guard = ExecutionGuard::default();
+            let keep_snapshots = guard.keep_snapshots_enabled();
             let summary = guard
                 .stage_write(trace_id, &args.path, &content, append)
                 .map_err(|error| WriteToolError::Other(error.to_string()))?;
+            let snapshot_policy = if keep_snapshots {
+                format!("After approval, rollback if needed: `/rollback {trace_id}`")
+            } else {
+                "默认会在写入成功后自动清理 `.order/snapshots/<trace_id>`；如需保留快照用于 /rollback，请设置 ORDER_KEEP_SNAPSHOTS=1".to_string()
+            };
 
             // 暂存成功必须返回 Ok，避免模型把“待审批写入”误判为失败并退化成纯口头承诺。
             Ok(format!(
@@ -142,14 +148,15 @@ Run in TUI:\n\
 - `/approve {trace_id}` to apply writes (snapshot will be created automatically)\n\
 - `/reject {trace_id}` to discard staged writes\n\
 \n\
-After approval, rollback if needed: `/rollback {trace_id}`",
+{snapshot_policy}",
                 summary.path,
                 summary.append,
                 summary.diff.existed,
                 summary.diff.old_lines,
                 summary.diff.new_lines,
                 summary.diff.added_lines,
-                summary.diff.removed_lines
+                summary.diff.removed_lines,
+                snapshot_policy = snapshot_policy
             ))
         })();
 

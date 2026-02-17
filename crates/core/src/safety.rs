@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -69,6 +69,13 @@ pub struct ApplyPendingResult {
     pub trace_id: String,
     /// 实际写入的文件列表（工作区相对路径）。
     pub files: Vec<String>,
+    /// 是否保留了本次写入前快照。
+    ///
+    /// - `true`：快照仍在 `.order/snapshots/<trace_id>`；
+    /// - `false`：快照已按策略清理。
+    pub snapshot_retained: bool,
+    /// 自动清理快照失败时的错误信息（仅作为提示，不影响写入成功结果）。
+    pub snapshot_cleanup_error: Option<String>,
 }
 
 /// 回滚结果。
@@ -86,6 +93,15 @@ static OP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct ExecutionGuard;
 
 impl ExecutionGuard {
+    /// 当前是否启用“写入后保留快照”。
+    ///
+    /// 默认策略是“写入成功后自动删除 `.order/snapshots/<trace_id>` 中的代码副本”，
+    /// 避免旧快照持续干扰检索与阅读；若需要保留以支持 `/rollback`，
+    /// 可设置环境变量 `ORDER_KEEP_SNAPSHOTS=1`（或 true/yes/on）。
+    pub fn keep_snapshots_enabled(&self) -> bool {
+        keep_snapshots_enabled()
+    }
+
     /// 当前仓库内：写文件视为高风险操作。
     ///
     /// 保守策略的原因：
@@ -110,6 +126,8 @@ impl ExecutionGuard {
 
         // 统一将 CRLF 规范为 LF，减少跨平台 diff 噪音。
         let normalized_content = content.replace("\r\n", "\n");
+        // 拦截明显未替换的占位内容，避免把整文件覆盖成 `<same>` 这类无效文本。
+        validate_write_content(relative_path, &normalized_content, append)?;
 
         let risk = self.classify_write(&resolved, append, &normalized_content);
         if risk != RiskLevel::HighRisk {
@@ -186,6 +204,11 @@ impl ExecutionGuard {
             return Err(anyhow!("待确认写入目录为空: {}", pending_dir.display()));
         }
 
+        // 二次校验 pending 记录，防止历史脏数据或手工篡改绕过 stage 阶段检查。
+        for record in &records {
+            validate_write_content(&record.path, &record.content, record.append)?;
+        }
+
         // 为避免“先写后快照”导致快照失效，先对所有目标文件建立快照。
         let snapshot_dir = snapshot_trace_dir(&root, trace_id);
         create_snapshot(&root, &snapshot_dir, &records)?;
@@ -227,6 +250,11 @@ impl ExecutionGuard {
         fs::remove_dir_all(&pending_dir)
             .with_context(|| format!("清理 pending 目录失败: {}", pending_dir.display()))?;
 
+        // 按策略清理快照副本：默认清理，避免 `.order/snapshots` 长期堆积历史代码副本。
+        // 若用户显式启用保留（ORDER_KEEP_SNAPSHOTS=1），则继续保留供 /rollback 使用。
+        let (snapshot_retained, snapshot_cleanup_error) =
+            cleanup_snapshot_after_apply(&snapshot_dir, self.keep_snapshots_enabled());
+
         // 对外只返回相对路径列表，避免泄露绝对路径细节。
         touched_files.sort();
         touched_files.dedup();
@@ -234,6 +262,8 @@ impl ExecutionGuard {
         Ok(ApplyPendingResult {
             trace_id: trace_id.to_string(),
             files: touched_files,
+            snapshot_retained,
+            snapshot_cleanup_error,
         })
     }
 
@@ -254,7 +284,12 @@ impl ExecutionGuard {
         let root = workspace_root().map_err(|e| anyhow!(e))?;
         let snapshot_dir = snapshot_trace_dir(&root, trace_id);
         if !snapshot_dir.exists() {
-            return Err(anyhow!("未找到快照目录: trace_id={trace_id}"));
+            let hint = if self.keep_snapshots_enabled() {
+                String::new()
+            } else {
+                "（当前默认写入后自动清理快照；如需保留请设置 ORDER_KEEP_SNAPSHOTS=1）".to_string()
+            };
+            return Err(anyhow!("未找到快照目录: trace_id={trace_id}{hint}"));
         }
 
         let manifest_path = snapshot_dir.join("manifest.json");
@@ -372,6 +407,22 @@ fn snapshot_trace_dir(workspace_root: &Path, trace_id: &str) -> PathBuf {
         .join(trace_id)
 }
 
+/// 当前进程是否启用“保留写入快照”。
+fn keep_snapshots_enabled() -> bool {
+    match env::var("ORDER_KEEP_SNAPSHOTS") {
+        Ok(value) => parse_env_truthy(&value),
+        Err(_) => false,
+    }
+}
+
+/// 将环境变量文本解析为布尔值（真值集合）。
+fn parse_env_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotManifest {
     trace_id: String,
@@ -471,6 +522,35 @@ fn create_snapshot(
         .with_context(|| format!("写入快照 manifest 失败: {}", manifest_path.display()))
 }
 
+/// 写入成功后的快照清理策略。
+///
+/// 返回 `(snapshot_retained, cleanup_error)`：
+/// - `snapshot_retained=true`：快照仍保留（策略保留或清理失败）；
+/// - `snapshot_retained=false`：快照已删除（或原本不存在）；
+/// - `cleanup_error` 仅在“尝试删除失败”时给出说明。
+fn cleanup_snapshot_after_apply(
+    snapshot_dir: &Path,
+    keep_snapshot: bool,
+) -> (bool, Option<String>) {
+    if keep_snapshot {
+        return (true, None);
+    }
+    if !snapshot_dir.exists() {
+        return (false, None);
+    }
+
+    match fs::remove_dir_all(snapshot_dir) {
+        Ok(()) => (false, None),
+        Err(error) => (
+            true,
+            Some(format!(
+                "自动清理快照失败: {} ({error})",
+                snapshot_dir.display()
+            )),
+        ),
+    }
+}
+
 fn dedup_snapshot_items(items: Vec<SnapshotFileItem>) -> Vec<SnapshotFileItem> {
     let mut map: BTreeMap<String, SnapshotFileItem> = BTreeMap::new();
     for item in items {
@@ -540,4 +620,162 @@ fn estimate_line_delta(old_lines: &[&str], new_lines: &[&str]) -> (usize, usize)
     }
 
     (added, removed)
+}
+
+/// 校验写入内容是否包含明显未替换的占位符。
+///
+/// 只拦截“整文件替换且正文仅为 `<same>`”这一高风险场景：
+/// - 该内容几乎不可能是用户真实意图；
+/// - 一旦落盘会直接破坏源码可编译性；
+/// - 仅对覆盖写入生效，避免误伤追加文本这类合法用例。
+fn validate_write_content(path: &str, content: &str, append: bool) -> Result<()> {
+    if append {
+        return Ok(());
+    }
+
+    let trimmed = content.trim();
+    if is_suspicious_placeholder_text(trimmed) {
+        return Err(anyhow!(
+            "检测到未替换占位符 `{}`，拒绝覆盖写入: {}",
+            trimmed,
+            path
+        ));
+    }
+
+    Ok(())
+}
+
+/// 判断文本是否是“整文件占位符”。
+///
+/// 拦截目标是 `<same>`、`<omitted>`、`<redacted>` 这类模型占位输出，
+/// 防止在审批通过后把真实源码覆盖成一行无效文本。
+fn is_suspicious_placeholder_text(trimmed: &str) -> bool {
+    if trimmed.len() < 3 || trimmed.len() > 80 {
+        return false;
+    }
+    if !trimmed.starts_with('<') || !trimmed.ends_with('>') {
+        return false;
+    }
+
+    let body = &trimmed[1..trimmed.len() - 1];
+    if body.is_empty() || body.len() > 64 {
+        return false;
+    }
+    // 仅拦截“单标签式占位符”，避免误伤带嵌套符号的真实内容。
+    if body.contains('<') || body.contains('>') {
+        return false;
+    }
+
+    let normalized = body.to_ascii_lowercase();
+    [
+        "same",
+        "omitted",
+        "placeholder",
+        "redacted",
+        "truncated",
+        "elided",
+        "unchanged",
+    ]
+    .iter()
+    .any(|keyword| normalized.contains(keyword))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        cleanup_snapshot_after_apply, is_suspicious_placeholder_text, parse_env_truthy,
+        validate_write_content,
+    };
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn new_temp_snapshot_dir() -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("order-snapshot-cleanup-{stamp}-{seq}"))
+    }
+
+    #[test]
+    fn validate_write_content_should_reject_same_placeholder_on_replace() {
+        let result = validate_write_content("crates/rander/src/history.rs", "  <same>\n", false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_write_content_should_allow_normal_replace_content() {
+        let result = validate_write_content(
+            "crates/rander/src/history.rs",
+            "use anyhow::{Context, Result};\n",
+            false,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_write_content_should_allow_append_even_when_text_matches_placeholder() {
+        let result = validate_write_content("notes.txt", "<same>", true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_write_content_should_reject_omitted_placeholder_on_replace() {
+        let result = validate_write_content("crates/rander/src/history.rs", "\n<omitted>\n", false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn is_suspicious_placeholder_text_should_allow_normal_markup() {
+        assert!(!is_suspicious_placeholder_text("<div>"));
+        assert!(!is_suspicious_placeholder_text("<details>内容</details>"));
+    }
+
+    #[test]
+    fn parse_env_truthy_should_match_expected_values() {
+        assert!(parse_env_truthy("1"));
+        assert!(parse_env_truthy("true"));
+        assert!(parse_env_truthy(" YES "));
+        assert!(parse_env_truthy("On"));
+        assert!(!parse_env_truthy("0"));
+        assert!(!parse_env_truthy("false"));
+        assert!(!parse_env_truthy("off"));
+        assert!(!parse_env_truthy("random"));
+    }
+
+    #[test]
+    fn cleanup_snapshot_after_apply_should_remove_dir_when_keep_disabled() {
+        let snapshot_dir = new_temp_snapshot_dir();
+        let files_dir = snapshot_dir.join("files");
+        fs::create_dir_all(&files_dir).expect("snapshot files dir should be created");
+        fs::write(snapshot_dir.join("manifest.json"), "{}\n").expect("manifest should be created");
+        fs::write(files_dir.join("history.rs"), "content")
+            .expect("snapshot file should be created");
+
+        let (retained, cleanup_error) = cleanup_snapshot_after_apply(&snapshot_dir, false);
+        assert!(!retained);
+        assert!(cleanup_error.is_none());
+        assert!(!snapshot_dir.exists());
+    }
+
+    #[test]
+    fn cleanup_snapshot_after_apply_should_keep_dir_when_keep_enabled() {
+        let snapshot_dir = new_temp_snapshot_dir();
+        let files_dir = snapshot_dir.join("files");
+        fs::create_dir_all(&files_dir).expect("snapshot files dir should be created");
+
+        let (retained, cleanup_error) = cleanup_snapshot_after_apply(&snapshot_dir, true);
+        assert!(retained);
+        assert!(cleanup_error.is_none());
+        assert!(snapshot_dir.exists());
+
+        fs::remove_dir_all(&snapshot_dir).expect("temp snapshot dir should be removed");
+    }
 }
