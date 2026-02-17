@@ -116,11 +116,12 @@ cargo check --workspace
 - `support_tools`：是否启用工具调用（见下）
 - `default_max_turns`：可选；agent 多轮上限（`0` 表示使用系统默认值，当前默认 `12`）
 
-当 `provider` 为 `openai` 或 `codex` 且 `support_tools = true` 时，会启用内置文件工具：
+当 `provider` 为 `openai` 或 `codex` 且 `support_tools = true` 时，会启用内置工具：
 
 - `ReadTool`：读取工作区内文件（仅相对路径、UTF-8、大小受限）
 - `WriteTool`：写入工作区内文件（仅相对路径、默认写入 LF、大小受限；需要用户确认时会弹出 `同意 / 不同意 / 同意之后一切修改` 三选项，可用 `↑/↓ + Enter` 选择）
 - `SearchFileTool`：在工作区内递归搜索关键字（仅相对路径、结果数量受限，返回可直接传给 `ReadTool` 的相对路径）
+- `CommandTool`：在工作区根目录执行终端命令（支持超时控制，返回退出码 + stdout/stderr，输出过长时会截断）
 
 补充说明：
 

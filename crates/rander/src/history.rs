@@ -1081,7 +1081,11 @@ mod tests {
             context_message(ContextRole::User, "用户偏好：优先修复根因", true),
             context_message(ContextRole::User, "最终决定采用最小改动方案", true),
             context_message(ContextRole::User, "最终决定采用最小改动方案", true),
-            context_message(ContextRole::Assistant, "已确认，我会继续按既定方案提交第一批补丁", true),
+            context_message(
+                ContextRole::Assistant,
+                "已确认，我会继续按既定方案提交第一批补丁",
+                true,
+            ),
         ];
 
         manager

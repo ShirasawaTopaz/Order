@@ -32,7 +32,9 @@ use super::{
 use crate::observability::{
     AgentEvent, log_event_best_effort, ts, with_trace_id, workspace_root_best_effort,
 };
-use crate::tool::{read::ReadTool, search_file::SearchFileTool, write::WriteTool};
+use crate::tool::{
+    command::CommandTool, read::ReadTool, search_file::SearchFileTool, write::WriteTool,
+};
 
 /// 默认系统提示。
 ///
@@ -48,7 +50,8 @@ pub const PREMABLE: &str = r#"你是仓库内的代码助手。
 6. 仅当存在真实阻塞（如需求冲突、权限限制、上下文缺失且无法通过工具补齐）时，才进行最小化追问。
 7. 当用户请求“修改代码/修复问题/实现功能”时，默认立即动手执行：必须调用工具完成改动，而不是只回复计划、确认或承诺“下一步会做”。
 8. 禁止只输出类似“我会继续”“我现在开始提交补丁”的过程性话术；若可以执行，就直接执行并产出结果。
-9. 完成改动后，给出最小必要的结果说明：改了哪些文件、为什么这么改、如何验证。"#;
+9. 完成改动后，给出最小必要的结果说明：改了哪些文件、为什么这么改、如何验证。
+10. 当需要执行构建、测试、格式化等终端命令时，直接调用 CommandTool，不要只口头描述“准备执行”。"#;
 
 /// agent 多轮上限默认值。
 ///
@@ -83,6 +86,8 @@ macro_rules! build_agent_with_options {
                     .tool(ReadTool)
                     .tool(WriteTool)
                     .tool(SearchFileTool)
+                    // 在启用工具的会话里同步开放命令执行能力，避免模型只能“口头承诺会运行测试”。
+                    .tool(CommandTool)
                     .default_max_turns(max_turns)
                     .build()
             } else {
@@ -90,6 +95,8 @@ macro_rules! build_agent_with_options {
                     .tool(ReadTool)
                     .tool(WriteTool)
                     .tool(SearchFileTool)
+                    // 与 preamble 开关保持一致，确保工具集合在不同构建路径下行为一致。
+                    .tool(CommandTool)
                     .default_max_turns(max_turns)
                     .build()
             }

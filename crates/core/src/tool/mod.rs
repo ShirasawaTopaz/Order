@@ -1,3 +1,4 @@
+pub mod command;
 pub mod read;
 pub mod search_file;
 pub mod write;
